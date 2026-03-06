@@ -1,0 +1,13 @@
+# Go build outputs
+backend/bin/
+*.exe
+*.test
+*.out
+
+# Environment files
+.env
+.env.*
+
+# IDE / OS
+.DS_Store
+Thumbs.db
