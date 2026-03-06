@@ -43,6 +43,11 @@ func (s *Store) CreateGuest(nickname string, ttl time.Duration) (PlayerSession, 
 		return PlayerSession{}, fmt.Errorf("failed to generate player id: %w", err)
 	}
 
+	return s.Create(playerID, nickname, ttl)
+}
+
+// Create는 지정된 플레이어 ID로 세션을 생성하고 저장한다.
+func (s *Store) Create(playerID, nickname string, ttl time.Duration) (PlayerSession, error) {
 	sessionID, err := newID("ses")
 	if err != nil {
 		return PlayerSession{}, fmt.Errorf("failed to generate session id: %w", err)
@@ -60,6 +65,13 @@ func (s *Store) CreateGuest(nickname string, ttl time.Duration) (PlayerSession, 
 	s.mu.Unlock()
 
 	return session, nil
+}
+
+// Delete는 세션 ID를 기준으로 메모리 세션을 제거한다.
+func (s *Store) Delete(sessionID string) {
+	s.mu.Lock()
+	delete(s.sessions, sessionID)
+	s.mu.Unlock()
 }
 
 // FindValid는 세션 ID로 유효한 세션을 조회한다.

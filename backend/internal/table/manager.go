@@ -18,9 +18,9 @@ func NewManager(defaultTableID string) *Manager {
 }
 
 // Join은 지정된 테이블에 플레이어를 입장시킨다.
-func (m *Manager) Join(tableID, playerID, nickname string, preferredSeat *int) (Snapshot, uint64, error) {
+func (m *Manager) Join(tableID, playerID, nickname string, stack int64, preferredSeat *int) (Snapshot, uint64, error) {
 	table := m.getOrCreateTable(tableID)
-	return table.Join(playerID, nickname, preferredSeat)
+	return table.Join(playerID, nickname, stack, preferredSeat)
 }
 
 // Leave는 지정된 테이블에서 플레이어를 퇴장시킨다.

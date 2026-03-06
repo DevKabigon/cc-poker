@@ -5,7 +5,7 @@ import "testing"
 func TestCanStartWithMinimumPlayers(t *testing.T) {
 	tbl := New("table-1")
 
-	snapshot, _, err := tbl.Join("player-1", "Guest-1", nil)
+	snapshot, _, err := tbl.Join("player-1", "Guest-1", 200, nil)
 	if err != nil {
 		t.Fatalf("first join failed: %v", err)
 	}
@@ -14,7 +14,7 @@ func TestCanStartWithMinimumPlayers(t *testing.T) {
 		t.Fatalf("expected can_start=false with 1 player, got true")
 	}
 
-	snapshot, _, err = tbl.Join("player-2", "Guest-2", nil)
+	snapshot, _, err = tbl.Join("player-2", "Guest-2", 200, nil)
 	if err != nil {
 		t.Fatalf("second join failed: %v", err)
 	}

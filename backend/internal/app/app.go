@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/DevKabigon/cc-poker/backend/internal/auth"
 	"github.com/DevKabigon/cc-poker/backend/internal/config"
 	"github.com/DevKabigon/cc-poker/backend/internal/protocol"
 	"github.com/DevKabigon/cc-poker/backend/internal/session"
@@ -32,6 +33,35 @@ type guestSessionResponse struct {
 	ExpiresAt string `json:"expires_at"`
 }
 
+type authExchangeRequest struct {
+	AccessToken string `json:"access_token"`
+	Nickname    string `json:"nickname"`
+}
+
+type authExchangeResponse struct {
+	PlayerID      string `json:"player_id"`
+	Nickname      string `json:"nickname"`
+	Email         string `json:"email"`
+	EmailVerified bool   `json:"email_verified"`
+	ExpiresAt     string `json:"expires_at"`
+}
+
+type tableBuyInRequest struct {
+	TableID string `json:"table_id"`
+	Amount  int64  `json:"amount"`
+}
+
+type tableBuyInResponse struct {
+	BuyInID      int64  `json:"buy_in_id"`
+	PlayerID     string `json:"player_id"`
+	TableID      string `json:"table_id"`
+	RoomID       string `json:"room_id"`
+	Amount       int64  `json:"amount"`
+	BalanceAfter int64  `json:"balance_after"`
+	Status       string `json:"status"`
+	CreatedAt    string `json:"created_at"`
+}
+
 type healthResponse struct {
 	Status    string `json:"status"`
 	Service   string `json:"service"`
@@ -46,6 +76,7 @@ type App struct {
 	tables        *table.Manager
 	snapshotStore store.TableSnapshotStore
 	eventStore    store.EventStore
+	authVerifier  auth.Verifier
 	hub           *wsHub
 	mux           *http.ServeMux
 	upgrader      websocket.Upgrader
@@ -53,10 +84,20 @@ type App struct {
 
 // New는 앱 인스턴스를 초기화하고 라우트를 구성한다.
 func New(cfg config.Config, logger *log.Logger) *App {
-	return newWithSnapshotStore(cfg, logger, nil)
+	return newWithStores(cfg, logger, nil, nil, nil)
 }
 
 func newWithSnapshotStore(cfg config.Config, logger *log.Logger, snapshotStore store.TableSnapshotStore) *App {
+	return newWithStores(cfg, logger, snapshotStore, nil, nil)
+}
+
+func newWithStores(
+	cfg config.Config,
+	logger *log.Logger,
+	snapshotStore store.TableSnapshotStore,
+	eventStore store.EventStore,
+	authVerifier auth.Verifier,
+) *App {
 	if logger == nil {
 		logger = log.New(os.Stdout, "", log.LstdFlags|log.LUTC)
 	}
@@ -65,7 +106,12 @@ func newWithSnapshotStore(cfg config.Config, logger *log.Logger, snapshotStore s
 		snapshotStore = buildSnapshotStore(cfg, logger)
 	}
 
-	eventStore := buildEventStore(cfg, logger)
+	if eventStore == nil {
+		eventStore = buildEventStore(cfg, logger)
+	}
+	if authVerifier == nil {
+		authVerifier = buildAuthVerifier(cfg, logger)
+	}
 
 	app := &App{
 		cfg:           cfg,
@@ -74,6 +120,7 @@ func newWithSnapshotStore(cfg config.Config, logger *log.Logger, snapshotStore s
 		tables:        table.NewManager(cfg.DefaultTableID),
 		snapshotStore: snapshotStore,
 		eventStore:    eventStore,
+		authVerifier:  authVerifier,
 		hub:           newWSHub(),
 		mux:           http.NewServeMux(),
 	}
@@ -81,6 +128,8 @@ func newWithSnapshotStore(cfg config.Config, logger *log.Logger, snapshotStore s
 	app.upgrader = websocket.Upgrader{
 		CheckOrigin: app.checkOrigin,
 	}
+
+	app.seedInitialData()
 	app.restoreSnapshot(cfg.DefaultTableID)
 	app.registerRoutes()
 
@@ -121,6 +170,28 @@ func buildEventStore(cfg config.Config, logger *log.Logger) store.EventStore {
 	return eventStore
 }
 
+func buildAuthVerifier(cfg config.Config, logger *log.Logger) auth.Verifier {
+	verifier := auth.NewSupabaseVerifier(auth.SupabaseConfig{
+		Enabled: cfg.SupabaseEnabled,
+		URL:     cfg.SupabaseURL,
+		AnonKey: cfg.SupabaseAnonKey,
+		Timeout: cfg.SupabaseTimeout,
+	})
+	if !cfg.SupabaseEnabled {
+		logger.Printf("supabase auth verifier disabled")
+	}
+	return verifier
+}
+
+func (a *App) seedInitialData() {
+	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.PostgresTimeout)
+	defer cancel()
+
+	if err := a.eventStore.SeedRoomsAndTables(ctx); err != nil {
+		a.logger.Printf("failed to seed rooms/tables: %v", err)
+	}
+}
+
 // Handler는 앱의 HTTP 핸들러를 반환한다.
 func (a *App) Handler() http.Handler {
 	return a.mux
@@ -129,6 +200,9 @@ func (a *App) Handler() http.Handler {
 func (a *App) registerRoutes() {
 	a.mux.HandleFunc("/health", a.handleHealth)
 	a.mux.HandleFunc("/v1/session/guest", a.handleGuestSession)
+	a.mux.HandleFunc("/v1/auth/exchange", a.handleAuthExchange)
+	a.mux.HandleFunc("/v1/auth/logout", a.handleAuthLogout)
+	a.mux.HandleFunc("/v1/tables/buy-in", a.handleTableBuyIn)
 	a.mux.HandleFunc("/ws", a.handleWebSocket)
 }
 
@@ -165,11 +239,141 @@ func (a *App) handleGuestSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.persistSession(created)
+	a.ensureWallet(created.PlayerID, a.cfg.GuestWalletInitial)
 	a.setSessionCookie(w, created)
 	writeJSON(w, http.StatusCreated, guestSessionResponse{
 		PlayerID:  created.PlayerID,
 		Nickname:  created.Nickname,
 		ExpiresAt: created.ExpiresAt.UTC().Format(time.RFC3339),
+	})
+}
+
+// handleAuthExchange는 Supabase access token을 서버 세션 쿠키로 교환한다.
+func (a *App) handleAuthExchange(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req authExchangeRequest
+	if r.Body == nil {
+		http.Error(w, "request body is required", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json body", http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.SupabaseTimeout)
+	defer cancel()
+
+	authUser, err := a.authVerifier.VerifyAccessToken(ctx, req.AccessToken)
+	if err != nil {
+		statusCode, message := authErrorToHTTP(err)
+		http.Error(w, message, statusCode)
+		return
+	}
+
+	playerID := authUserToPlayerID(authUser.UserID)
+	nickname := resolveAuthNickname(req.Nickname, authUser)
+	created, err := a.sessions.Create(playerID, nickname, a.cfg.SessionTTL)
+	if err != nil {
+		a.logger.Printf("failed to create auth session: %v", err)
+		http.Error(w, "failed to create session", http.StatusInternalServerError)
+		return
+	}
+
+	a.persistSession(created)
+	a.ensureWallet(created.PlayerID, a.cfg.AuthWalletInitial)
+	a.setSessionCookie(w, created)
+
+	writeJSON(w, http.StatusCreated, authExchangeResponse{
+		PlayerID:      created.PlayerID,
+		Nickname:      created.Nickname,
+		Email:         authUser.Email,
+		EmailVerified: authUser.EmailVerified,
+		ExpiresAt:     created.ExpiresAt.UTC().Format(time.RFC3339),
+	})
+}
+
+// handleAuthLogout은 세션 쿠키를 만료시키고 메모리 세션을 제거한다.
+func (a *App) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	cookie, err := r.Cookie(a.cfg.SessionCookieName)
+	if err == nil && strings.TrimSpace(cookie.Value) != "" {
+		a.sessions.Delete(cookie.Value)
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     a.cfg.SessionCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   a.cfg.CookieSecure,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+		Expires:  time.Unix(0, 0),
+	})
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleTableBuyIn은 쿠키 인증된 플레이어의 테이블 바이인을 생성한다.
+func (a *App) handleTableBuyIn(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	playerSession, ok := a.authFromCookie(r)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var req tableBuyInRequest
+	if r.Body == nil {
+		http.Error(w, "request body is required", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json body", http.StatusBadRequest)
+		return
+	}
+
+	tableID := a.resolveTableID(req.TableID)
+	if req.Amount <= 0 {
+		http.Error(w, "buy-in amount must be positive", http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.PostgresTimeout)
+	defer cancel()
+
+	receipt, err := a.eventStore.CreateBuyIn(ctx, playerSession.PlayerID, tableID, req.Amount)
+	if err != nil {
+		statusCode, message := buyInErrorToHTTP(err)
+		http.Error(w, message, statusCode)
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, tableBuyInResponse{
+		BuyInID:      receipt.BuyInID,
+		PlayerID:     receipt.PlayerID,
+		TableID:      receipt.TableID,
+		RoomID:       receipt.RoomID,
+		Amount:       receipt.Amount,
+		BalanceAfter: receipt.BalanceAfter,
+		Status:       receipt.Status,
+		CreatedAt:    receipt.CreatedAt.UTC().Format(time.RFC3339),
 	})
 }
 
@@ -270,6 +474,27 @@ func (a *App) handleJoinTableEvent(client *wsClient, payload json.RawMessage) ([
 	tableID := a.resolveTableID(joinReq.TableID)
 	currentTableID, seated := client.TableState()
 
+	// 같은 테이블 재입장 요청은 기존 좌석 상태를 그대로 재전송해 idempotent하게 처리한다.
+	if seated && currentTableID == tableID {
+		snapshot, seq := a.tables.Snapshot(tableID)
+		envelope := a.newSnapshotEnvelope(snapshot, seq)
+		if err := a.writeEnvelope(client, envelope); err != nil {
+			return nil, err
+		}
+		return []protocol.ServerEnvelope{envelope}, nil
+	}
+
+	if err := a.prevalidateJoinSeat(tableID, joinReq.SeatIndex); err != nil {
+		code, message := tableErrorToNotice(err)
+		return a.sendErrorNotice(client, code, message)
+	}
+
+	stack, err := a.consumePendingBuyIn(client.PlayerID(), tableID)
+	if err != nil {
+		code, message := buyInErrorToNotice(err)
+		return a.sendErrorNotice(client, code, message)
+	}
+
 	// 다른 테이블에 이미 앉아 있다면 기존 테이블에서 먼저 퇴장 처리한다.
 	if seated && currentTableID != tableID {
 		previousSnapshot, previousSeq, leaveErr := a.tables.Leave(currentTableID, client.PlayerID())
@@ -284,7 +509,7 @@ func (a *App) handleJoinTableEvent(client *wsClient, payload json.RawMessage) ([
 		}
 	}
 
-	snapshot, seq, err := a.tables.Join(tableID, client.PlayerID(), client.Nickname(), joinReq.SeatIndex)
+	snapshot, seq, err := a.tables.Join(tableID, client.PlayerID(), client.Nickname(), stack, joinReq.SeatIndex)
 	if err != nil {
 		code, message := tableErrorToNotice(err)
 		return a.sendErrorNotice(client, code, message)
@@ -426,6 +651,44 @@ func (a *App) persistSession(playerSession session.PlayerSession) {
 	}
 }
 
+func (a *App) ensureWallet(playerID string, initialBalance int64) {
+	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.PostgresTimeout)
+	defer cancel()
+
+	if err := a.eventStore.EnsureWallet(ctx, playerID, initialBalance); err != nil {
+		a.logger.Printf("failed to ensure wallet: player=%s err=%v", playerID, err)
+	}
+}
+
+func (a *App) consumePendingBuyIn(playerID, tableID string) (int64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.PostgresTimeout)
+	defer cancel()
+
+	receipt, err := a.eventStore.ConsumePendingBuyIn(ctx, playerID, tableID)
+	if err != nil {
+		return 0, err
+	}
+	return receipt.Amount, nil
+}
+
+func (a *App) prevalidateJoinSeat(tableID string, seatIndex *int) error {
+	if seatIndex == nil {
+		return nil
+	}
+	if *seatIndex < 0 || *seatIndex >= table.MaxPlayers {
+		return table.ErrSeatInvalid
+	}
+
+	// 바이인 소비 전에 좌석 충돌을 먼저 확인해 불필요한 차감을 줄인다.
+	snapshot, _ := a.tables.Snapshot(tableID)
+	for _, player := range snapshot.Players {
+		if player.SeatIndex == *seatIndex {
+			return table.ErrSeatTaken
+		}
+	}
+	return nil
+}
+
 func (a *App) persistTableEvent(eventType, playerID string, snapshot table.Snapshot, seq uint64) {
 	if !a.cfg.PostgresEnabled {
 		return
@@ -459,6 +722,7 @@ func snapshotPayload(snapshot table.Snapshot) protocol.TableSnapshotPayload {
 			PlayerID:  player.PlayerID,
 			Nickname:  player.Nickname,
 			SeatIndex: player.SeatIndex,
+			Stack:     player.Stack,
 		})
 	}
 
@@ -539,6 +803,90 @@ func tableErrorToNotice(err error) (string, string) {
 	default:
 		return "INTERNAL_ERROR", fmt.Sprintf("internal error: %v", err)
 	}
+}
+
+func buyInErrorToNotice(err error) (string, string) {
+	switch {
+	case errors.Is(err, store.ErrPendingBuyInNotFound):
+		return "BUY_IN_REQUIRED", "buy-in is required before joining table"
+	case errors.Is(err, store.ErrInvalidBuyInAmount):
+		return "INVALID_BUY_IN", "buy-in amount is invalid"
+	case errors.Is(err, store.ErrInsufficientBalance):
+		return "INSUFFICIENT_BALANCE", "wallet balance is insufficient"
+	case errors.Is(err, store.ErrTableNotFound):
+		return "TABLE_NOT_FOUND", "table not found"
+	default:
+		return "INTERNAL_ERROR", fmt.Sprintf("internal error: %v", err)
+	}
+}
+
+func buyInErrorToHTTP(err error) (int, string) {
+	switch {
+	case errors.Is(err, store.ErrTableNotFound):
+		return http.StatusNotFound, "table not found"
+	case errors.Is(err, store.ErrInvalidBuyInAmount):
+		return http.StatusBadRequest, "buy-in amount is out of allowed range"
+	case errors.Is(err, store.ErrInsufficientBalance):
+		return http.StatusConflict, "insufficient wallet balance"
+	default:
+		return http.StatusInternalServerError, "failed to create buy-in"
+	}
+}
+
+func authErrorToHTTP(err error) (int, string) {
+	switch {
+	case errors.Is(err, auth.ErrAuthDisabled):
+		return http.StatusServiceUnavailable, "auth exchange is disabled"
+	case errors.Is(err, auth.ErrInvalidAccessToken):
+		return http.StatusUnauthorized, "invalid access token"
+	case errors.Is(err, auth.ErrEmailNotVerified):
+		return http.StatusForbidden, "email verification is required"
+	default:
+		return http.StatusBadGateway, "failed to verify external auth token"
+	}
+}
+
+func authUserToPlayerID(authUserID string) string {
+	trimmed := strings.TrimSpace(authUserID)
+	normalized := strings.ReplaceAll(trimmed, "-", "")
+	if normalized == "" {
+		return "usr_unknown"
+	}
+	return "usr_" + normalized
+}
+
+func resolveAuthNickname(requestNickname string, authUser auth.User) string {
+	candidates := []string{
+		requestNickname,
+		authUser.Nickname,
+		emailLocalPart(authUser.Email),
+	}
+	for _, candidate := range candidates {
+		trimmed := strings.TrimSpace(candidate)
+		if trimmed == "" {
+			continue
+		}
+
+		runes := []rune(trimmed)
+		if len(runes) > 20 {
+			return string(runes[:20])
+		}
+		return trimmed
+	}
+	return "User"
+}
+
+func emailLocalPart(email string) string {
+	trimmed := strings.TrimSpace(email)
+	if trimmed == "" {
+		return ""
+	}
+
+	atIndex := strings.Index(trimmed, "@")
+	if atIndex <= 0 {
+		return ""
+	}
+	return trimmed[:atIndex]
 }
 
 func writeJSON(w http.ResponseWriter, statusCode int, payload any) {

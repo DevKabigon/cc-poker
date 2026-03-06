@@ -8,10 +8,12 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/DevKabigon/cc-poker/backend/internal/auth"
 	"github.com/DevKabigon/cc-poker/backend/internal/config"
 	"github.com/DevKabigon/cc-poker/backend/internal/protocol"
 	"github.com/DevKabigon/cc-poker/backend/internal/store"
@@ -21,28 +23,51 @@ import (
 
 func newTestApp() *App {
 	return newWithSnapshotStore(config.Config{
-		HTTPAddr:          ":0",
-		SessionCookieName: "cc_poker_session",
-		SessionTTL:        time.Hour,
-		CookieSecure:      false,
-		AllowedOrigins:    map[string]struct{}{},
-		DefaultTableID:    "table-1",
-		SnapshotEnabled:   false,
-		SnapshotTimeout:   time.Second,
+		HTTPAddr:           ":0",
+		SessionCookieName:  "cc_poker_session",
+		SessionTTL:         time.Hour,
+		CookieSecure:       false,
+		AllowedOrigins:     map[string]struct{}{},
+		DefaultTableID:     "table-1",
+		SnapshotEnabled:    false,
+		SnapshotTimeout:    time.Second,
+		PostgresTimeout:    time.Second,
+		GuestWalletInitial: 2000,
+		AuthWalletInitial:  10000,
 	}, log.New(io.Discard, "", 0), nil)
 }
 
 func newTestAppWithStore(snapshotStore store.TableSnapshotStore) *App {
 	return newWithSnapshotStore(config.Config{
-		HTTPAddr:          ":0",
-		SessionCookieName: "cc_poker_session",
-		SessionTTL:        time.Hour,
-		CookieSecure:      false,
-		AllowedOrigins:    map[string]struct{}{},
-		DefaultTableID:    "table-1",
-		SnapshotEnabled:   true,
-		SnapshotTimeout:   time.Second,
+		HTTPAddr:           ":0",
+		SessionCookieName:  "cc_poker_session",
+		SessionTTL:         time.Hour,
+		CookieSecure:       false,
+		AllowedOrigins:     map[string]struct{}{},
+		DefaultTableID:     "table-1",
+		SnapshotEnabled:    true,
+		SnapshotTimeout:    time.Second,
+		PostgresTimeout:    time.Second,
+		GuestWalletInitial: 2000,
+		AuthWalletInitial:  10000,
 	}, log.New(io.Discard, "", 0), snapshotStore)
+}
+
+func newTestAppWithAuthVerifier(verifier auth.Verifier) *App {
+	return newWithStores(config.Config{
+		HTTPAddr:           ":0",
+		SessionCookieName:  "cc_poker_session",
+		SessionTTL:         time.Hour,
+		CookieSecure:       false,
+		AllowedOrigins:     map[string]struct{}{},
+		DefaultTableID:     "table-1",
+		SnapshotEnabled:    false,
+		SnapshotTimeout:    time.Second,
+		PostgresTimeout:    time.Second,
+		GuestWalletInitial: 2000,
+		AuthWalletInitial:  10000,
+		SupabaseTimeout:    time.Second,
+	}, log.New(io.Discard, "", 0), nil, nil, verifier)
 }
 
 func TestGuestSessionSetsCookie(t *testing.T) {
@@ -73,6 +98,76 @@ func TestGuestSessionSetsCookie(t *testing.T) {
 	if !cookies[0].HttpOnly {
 		t.Fatalf("expected HttpOnly cookie")
 	}
+}
+
+func TestAuthExchangeRejectsUnverifiedEmail(t *testing.T) {
+	app := newTestAppWithAuthVerifier(fakeAuthVerifier{
+		user: auth.User{
+			UserID:        "auth-user-1",
+			Email:         "guest@example.com",
+			EmailVerified: false,
+		},
+		err: auth.ErrEmailNotVerified,
+	})
+
+	reqBody := bytes.NewBufferString(`{"access_token":"dummy-token"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/auth/exchange", reqBody)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	app.Handler().ServeHTTP(rec, req)
+	res := rec.Result()
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("unexpected status code: got=%d want=%d", res.StatusCode, http.StatusForbidden)
+	}
+}
+
+func TestAuthExchangeSetsCookieAndUsesAuthWalletInitial(t *testing.T) {
+	app := newTestAppWithAuthVerifier(fakeAuthVerifier{
+		user: auth.User{
+			UserID:        "4ec2f95f-7fd2-4f68-84f4-a8a173a0f3ce",
+			Email:         "verified@example.com",
+			EmailVerified: true,
+			Nickname:      "VerifiedUser",
+		},
+	})
+	server := httptest.NewServer(app.Handler())
+	defer server.Close()
+
+	reqBody := bytes.NewBufferString(`{"access_token":"dummy-token"}`)
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/auth/exchange", reqBody)
+	if err != nil {
+		t.Fatalf("failed to create auth exchange request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("failed to call auth exchange endpoint: %v", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("unexpected status code: got=%d want=%d", res.StatusCode, http.StatusCreated)
+	}
+
+	cookies := res.Cookies()
+	if len(cookies) == 0 {
+		t.Fatalf("expected session cookie in auth exchange response")
+	}
+
+	createBuyInExpectStatus(t, server.URL, cookies[0], "table-1", 2500, http.StatusCreated)
+}
+
+func TestGuestWalletInitialIs2000(t *testing.T) {
+	app := newTestApp()
+	server := httptest.NewServer(app.Handler())
+	defer server.Close()
+
+	cookie := issueGuestCookie(t, server.URL)
+	createBuyInExpectStatus(t, server.URL, cookie, "table-1", 2500, http.StatusConflict)
 }
 
 func TestWebSocketRejectsWithoutCookie(t *testing.T) {
@@ -150,6 +245,7 @@ func TestWebSocketBroadcastsSnapshotToOtherClientsOnJoin(t *testing.T) {
 		t.Fatalf("unexpected active players on first connect: got=%d want=0", snapshot.ActivePlayers)
 	}
 
+	createBuyIn(t, server.URL, cookie1, "table-1", 200)
 	sendJoinTable(t, conn1, "table-1")
 	snapshot = readSnapshot(t, conn1)
 	if snapshot.ActivePlayers != 1 {
@@ -165,6 +261,7 @@ func TestWebSocketBroadcastsSnapshotToOtherClientsOnJoin(t *testing.T) {
 		t.Fatalf("unexpected active players on second connect: got=%d want=1", snapshot.ActivePlayers)
 	}
 
+	createBuyIn(t, server.URL, cookie2, "table-1", 200)
 	sendJoinTable(t, conn2, "table-1")
 	snapshot2 := readSnapshot(t, conn2)
 	if snapshot2.ActivePlayers != 2 {
@@ -189,6 +286,7 @@ func TestWebSocketJoinIsIdempotentByRequestID(t *testing.T) {
 
 	_ = readSnapshotEnvelope(t, conn)
 
+	createBuyIn(t, server.URL, cookie, "table-1", 200)
 	sendJoinTableWithRequestID(t, conn, "table-1", "req-join-001")
 	first := readSnapshotEnvelope(t, conn)
 	if first.Payload.ActivePlayers != 1 {
@@ -338,6 +436,32 @@ func issueGuestCookie(t *testing.T, baseURL string) *http.Cookie {
 	return cookies[0]
 }
 
+func createBuyIn(t *testing.T, baseURL string, cookie *http.Cookie, tableID string, amount int64) {
+	createBuyInExpectStatus(t, baseURL, cookie, tableID, amount, http.StatusCreated)
+}
+
+func createBuyInExpectStatus(t *testing.T, baseURL string, cookie *http.Cookie, tableID string, amount int64, expectedStatus int) {
+	t.Helper()
+
+	reqBody := bytes.NewBufferString(`{"table_id":"` + tableID + `","amount":` + strconv.FormatInt(amount, 10) + `}`)
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/tables/buy-in", reqBody)
+	if err != nil {
+		t.Fatalf("failed to create buy-in request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(cookie)
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("failed to call buy-in endpoint: %v", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != expectedStatus {
+		t.Fatalf("unexpected buy-in status code: got=%d want=%d", res.StatusCode, expectedStatus)
+	}
+}
+
 type fakeSnapshotStore struct {
 	loadSnapshot table.Snapshot
 	loadSeq      uint64
@@ -352,4 +476,16 @@ func (f *fakeSnapshotStore) Save(context.Context, table.Snapshot, uint64) error 
 
 func (f *fakeSnapshotStore) Load(context.Context, string) (table.Snapshot, uint64, bool, error) {
 	return f.loadSnapshot, f.loadSeq, f.loadFound, f.loadErr
+}
+
+type fakeAuthVerifier struct {
+	user auth.User
+	err  error
+}
+
+func (f fakeAuthVerifier) VerifyAccessToken(context.Context, string) (auth.User, error) {
+	if f.err != nil {
+		return f.user, f.err
+	}
+	return f.user, nil
 }

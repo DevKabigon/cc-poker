@@ -45,6 +45,7 @@ type SnapshotPlayer struct {
 	PlayerID  string `json:"player_id"`
 	Nickname  string `json:"nickname"`
 	SeatIndex int    `json:"seat_index"`
+	Stack     int64  `json:"stack"`
 }
 
 // TableSnapshotPayload는 테이블 상태 전달 본문이다.

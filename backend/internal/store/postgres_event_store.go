@@ -4,6 +4,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"sort"
@@ -62,6 +63,272 @@ func NewEventStore(ctx context.Context, cfg PostgresEventStoreConfig) (EventStor
 
 type postgresEventStore struct {
 	pool *pgxpool.Pool
+}
+
+type seedRoom struct {
+	ID         string
+	Name       string
+	SmallBlind int64
+	BigBlind   int64
+	MinBuyIn   int64
+	MaxBuyIn   int64
+	MaxPlayers int
+}
+
+var defaultRooms = []seedRoom{
+	{
+		ID:         "room_1_2",
+		Name:       "$1/$2",
+		SmallBlind: 1,
+		BigBlind:   2,
+		MinBuyIn:   100,
+		MaxBuyIn:   400,
+		MaxPlayers: 9,
+	},
+	{
+		ID:         "room_2_5",
+		Name:       "$2/$5",
+		SmallBlind: 2,
+		BigBlind:   5,
+		MinBuyIn:   250,
+		MaxBuyIn:   1000,
+		MaxPlayers: 9,
+	},
+	{
+		ID:         "room_5_10",
+		Name:       "$5/$10",
+		SmallBlind: 5,
+		BigBlind:   10,
+		MinBuyIn:   500,
+		MaxBuyIn:   2000,
+		MaxPlayers: 9,
+	},
+}
+
+// SeedRoomsAndTables는 기본 룸/테이블 메타데이터를 DB에 삽입한다.
+func (s *postgresEventStore) SeedRoomsAndTables(ctx context.Context) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	for _, room := range defaultRooms {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO rooms (id, name, small_blind, big_blind, min_buy_in, max_buy_in, max_players)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (id) DO UPDATE
+			SET name = EXCLUDED.name,
+				small_blind = EXCLUDED.small_blind,
+				big_blind = EXCLUDED.big_blind,
+				min_buy_in = EXCLUDED.min_buy_in,
+				max_buy_in = EXCLUDED.max_buy_in,
+				max_players = EXCLUDED.max_players
+		`, room.ID, room.Name, room.SmallBlind, room.BigBlind, room.MinBuyIn, room.MaxBuyIn, room.MaxPlayers); err != nil {
+			return fmt.Errorf("failed to upsert room: %w", err)
+		}
+
+		for index := 1; index <= 10; index++ {
+			tableID := fmt.Sprintf("%s_table_%d", room.ID, index)
+			label := fmt.Sprintf("%s Table %d", room.Name, index)
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO tables (id, room_id, label, max_players, is_active)
+				VALUES ($1, $2, $3, $4, TRUE)
+				ON CONFLICT (id) DO UPDATE
+				SET room_id = EXCLUDED.room_id,
+					label = EXCLUDED.label,
+					max_players = EXCLUDED.max_players,
+					is_active = TRUE
+			`, tableID, room.ID, label, room.MaxPlayers); err != nil {
+				return fmt.Errorf("failed to upsert table: %w", err)
+			}
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit room seed tx: %w", err)
+	}
+	return nil
+}
+
+// EnsureWallet는 플레이어 지갑 레코드가 없으면 기본 잔액으로 생성한다.
+func (s *postgresEventStore) EnsureWallet(ctx context.Context, playerID string, initialBalance int64) error {
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO wallets (player_id, balance)
+		VALUES ($1, $2)
+		ON CONFLICT (player_id) DO NOTHING
+	`, playerID, initialBalance); err != nil {
+		return fmt.Errorf("failed to ensure wallet: %w", err)
+	}
+	return nil
+}
+
+// CreateBuyIn은 바이인 금액 검증/지갑 차감/바이인 생성을 원자적으로 처리한다.
+func (s *postgresEventStore) CreateBuyIn(ctx context.Context, playerID, tableID string, amount int64) (BuyInReceipt, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return BuyInReceipt{}, fmt.Errorf("failed to begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var roomID string
+	var minBuyIn int64
+	var maxBuyIn int64
+	if err := tx.QueryRow(ctx, `
+		SELECT r.id, r.min_buy_in, r.max_buy_in
+		FROM tables t
+		JOIN rooms r ON r.id = t.room_id
+		WHERE t.id = $1 AND t.is_active = TRUE
+	`, tableID).Scan(&roomID, &minBuyIn, &maxBuyIn); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return BuyInReceipt{}, ErrTableNotFound
+		}
+		return BuyInReceipt{}, fmt.Errorf("failed to load room/table for buy-in: %w", err)
+	}
+
+	if amount < minBuyIn || amount > maxBuyIn {
+		return BuyInReceipt{}, ErrInvalidBuyInAmount
+	}
+
+	var pending BuyInReceipt
+	pendingErr := tx.QueryRow(ctx, `
+		SELECT id, player_id, table_id, room_id, amount, status, created_at
+		FROM buy_ins
+		WHERE player_id = $1 AND table_id = $2 AND status = 'pending'
+		ORDER BY id DESC
+		LIMIT 1
+	`, playerID, tableID).Scan(
+		&pending.BuyInID,
+		&pending.PlayerID,
+		&pending.TableID,
+		&pending.RoomID,
+		&pending.Amount,
+		&pending.Status,
+		&pending.CreatedAt,
+	)
+	if pendingErr == nil {
+		var currentBalance int64
+		if err := tx.QueryRow(ctx, `SELECT balance FROM wallets WHERE player_id = $1`, playerID).Scan(&currentBalance); err == nil {
+			pending.BalanceAfter = currentBalance
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return BuyInReceipt{}, fmt.Errorf("failed to commit pending buy-in tx: %w", err)
+		}
+		return pending, nil
+	}
+	if pendingErr != nil && !errors.Is(pendingErr, pgx.ErrNoRows) {
+		return BuyInReceipt{}, fmt.Errorf("failed to query pending buy-in: %w", pendingErr)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO wallets (player_id, balance)
+		VALUES ($1, $2)
+		ON CONFLICT (player_id) DO NOTHING
+	`, playerID, int64(0)); err != nil {
+		return BuyInReceipt{}, fmt.Errorf("failed to ensure wallet in buy-in: %w", err)
+	}
+
+	var currentBalance int64
+	if err := tx.QueryRow(ctx, `
+		SELECT balance
+		FROM wallets
+		WHERE player_id = $1
+		FOR UPDATE
+	`, playerID).Scan(&currentBalance); err != nil {
+		return BuyInReceipt{}, fmt.Errorf("failed to lock wallet: %w", err)
+	}
+
+	if currentBalance < amount {
+		return BuyInReceipt{}, ErrInsufficientBalance
+	}
+
+	updatedBalance := currentBalance - amount
+	if _, err := tx.Exec(ctx, `
+		UPDATE wallets
+		SET balance = $2, updated_at = NOW()
+		WHERE player_id = $1
+	`, playerID, updatedBalance); err != nil {
+		return BuyInReceipt{}, fmt.Errorf("failed to update wallet balance: %w", err)
+	}
+
+	var receipt BuyInReceipt
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO buy_ins (player_id, table_id, room_id, amount, status)
+		VALUES ($1, $2, $3, $4, 'pending')
+		RETURNING id, player_id, table_id, room_id, amount, status, created_at
+	`, playerID, tableID, roomID, amount).Scan(
+		&receipt.BuyInID,
+		&receipt.PlayerID,
+		&receipt.TableID,
+		&receipt.RoomID,
+		&receipt.Amount,
+		&receipt.Status,
+		&receipt.CreatedAt,
+	); err != nil {
+		return BuyInReceipt{}, fmt.Errorf("failed to create pending buy-in: %w", err)
+	}
+	receipt.BalanceAfter = updatedBalance
+
+	if err := tx.Commit(ctx); err != nil {
+		return BuyInReceipt{}, fmt.Errorf("failed to commit buy-in tx: %w", err)
+	}
+	return receipt, nil
+}
+
+// ConsumePendingBuyIn은 입장 직전에 pending 바이인을 consumed 상태로 전환한다.
+func (s *postgresEventStore) ConsumePendingBuyIn(ctx context.Context, playerID, tableID string) (BuyInReceipt, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return BuyInReceipt{}, fmt.Errorf("failed to begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var receipt BuyInReceipt
+	if err := tx.QueryRow(ctx, `
+		SELECT id, player_id, table_id, room_id, amount, status, created_at
+		FROM buy_ins
+		WHERE player_id = $1 AND table_id = $2 AND status = 'pending'
+		ORDER BY id DESC
+		LIMIT 1
+		FOR UPDATE
+	`, playerID, tableID).Scan(
+		&receipt.BuyInID,
+		&receipt.PlayerID,
+		&receipt.TableID,
+		&receipt.RoomID,
+		&receipt.Amount,
+		&receipt.Status,
+		&receipt.CreatedAt,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return BuyInReceipt{}, ErrPendingBuyInNotFound
+		}
+		return BuyInReceipt{}, fmt.Errorf("failed to lock pending buy-in: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE buy_ins
+		SET status = 'consumed', consumed_at = NOW()
+		WHERE id = $1
+	`, receipt.BuyInID); err != nil {
+		return BuyInReceipt{}, fmt.Errorf("failed to mark buy-in consumed: %w", err)
+	}
+
+	var balance int64
+	if err := tx.QueryRow(ctx, `
+		SELECT balance
+		FROM wallets
+		WHERE player_id = $1
+	`, playerID).Scan(&balance); err != nil {
+		return BuyInReceipt{}, fmt.Errorf("failed to read balance after consume: %w", err)
+	}
+	receipt.BalanceAfter = balance
+	receipt.Status = "consumed"
+
+	if err := tx.Commit(ctx); err != nil {
+		return BuyInReceipt{}, fmt.Errorf("failed to commit consume tx: %w", err)
+	}
+	return receipt, nil
 }
 
 // SaveSession은 유저/세션 정보를 저장한다.

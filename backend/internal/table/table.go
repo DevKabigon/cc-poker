@@ -32,6 +32,7 @@ type Player struct {
 	PlayerID  string `json:"player_id"`
 	Nickname  string `json:"nickname"`
 	SeatIndex int    `json:"seat_index"`
+	Stack     int64  `json:"stack"`
 }
 
 // Snapshot은 테이블 현재 상태를 직렬화 가능한 형태로 표현한다.
@@ -62,7 +63,7 @@ func New(tableID string) *Table {
 }
 
 // Join은 플레이어를 좌석에 배치하고 최신 스냅샷을 반환한다.
-func (t *Table) Join(playerID, nickname string, preferredSeat *int) (Snapshot, uint64, error) {
+func (t *Table) Join(playerID, nickname string, stack int64, preferredSeat *int) (Snapshot, uint64, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -80,6 +81,7 @@ func (t *Table) Join(playerID, nickname string, preferredSeat *int) (Snapshot, u
 		PlayerID:  playerID,
 		Nickname:  nickname,
 		SeatIndex: seatIndex,
+		Stack:     stack,
 	}
 	t.seats[seatIndex] = player
 	t.playerSeat[playerID] = seatIndex

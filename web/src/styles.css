@@ -101,6 +101,22 @@ body {
   gap: 10px;
 }
 
+.button-row a {
+  height: 42px;
+  padding: 0 16px;
+  border: 1px solid rgba(255, 222, 119, 0.7);
+  border-radius: 10px;
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.button-row a.active {
+  background: rgba(255, 222, 119, 0.14);
+}
+
 button {
   font-family: inherit;
   height: 42px;
