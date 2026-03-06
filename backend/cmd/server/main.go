@@ -17,6 +17,12 @@ import (
 func main() {
 	cfg := config.Load()
 	logger := log.New(os.Stdout, "", log.LstdFlags|log.LUTC)
+	logger.Printf(
+		"config loaded: supabase_enabled=%t supabase_url_set=%t supabase_key_set=%t",
+		cfg.SupabaseEnabled,
+		cfg.SupabaseURL != "",
+		cfg.SupabaseAnonKey != "",
+	)
 	application := app.New(cfg, logger)
 
 	server := &http.Server{

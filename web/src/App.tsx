@@ -37,6 +37,10 @@ type HealthResponse = {
 };
 
 type ConnectionStatus = "idle" | "connecting" | "connected" | "closed" | "error";
+type UiNotice = {
+  kind: "success" | "info";
+  message: string;
+} | null;
 
 const DEFAULT_TABLE = "room_1_2_table_1";
 const SUPABASE_URL = String(import.meta.env.VITE_SUPABASE_URL ?? "").trim();
@@ -61,6 +65,7 @@ function PlayPage() {
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [snapshot, setSnapshot] = useState<TableSnapshot | null>(null);
   const [events, setEvents] = useState<string[]>([]);
+  const [notice, setNotice] = useState<UiNotice>(null);
   const [selectedTable, setSelectedTable] = useState(DEFAULT_TABLE);
   const [buyInAmount, setBuyInAmount] = useState("200");
   const wsRef = useRef<WebSocket | null>(null);
@@ -135,6 +140,7 @@ function PlayPage() {
       const data = (await response.json()) as SessionSnapshot;
       applySession(data);
       appendEvent("GUEST_OK");
+      setNotice({ kind: "info", message: "게스트 세션이 생성되었습니다." });
     } catch (error) {
       const message = error instanceof Error ? error.message : "unknown session error";
       setLastError(message);
@@ -144,6 +150,7 @@ function PlayPage() {
 
   const signUpWithSupabase = useCallback(async () => {
     clearLastError();
+    setNotice(null);
     try {
       requireSupabaseConfig();
       if (!email.trim() || !password.trim()) {
@@ -169,6 +176,9 @@ function PlayPage() {
       }
 
       appendEvent("SIGNUP_OK verify your email");
+      const successMessage = "회원가입이 완료되었습니다. 이메일 인증 링크를 확인해주세요.";
+      setNotice({ kind: "success", message: successMessage });
+      window.alert(successMessage);
     } catch (error) {
       const message = error instanceof Error ? error.message : "unknown signup error";
       setLastError(message);
@@ -186,6 +196,7 @@ function PlayPage() {
 
   const signInWithSupabase = useCallback(async () => {
     clearLastError();
+    setNotice(null);
     try {
       requireSupabaseConfig();
       if (!email.trim() || !password.trim()) {
@@ -212,6 +223,7 @@ function PlayPage() {
       const payload = (await response.json()) as SupabaseLoginResponse;
       await exchangeAccessToken(payload.access_token);
       appendEvent("SIGNIN_OK");
+      setNotice({ kind: "success", message: "로그인 및 세션 교환이 완료되었습니다." });
     } catch (error) {
       const message = error instanceof Error ? error.message : "unknown signin error";
       setLastError(message);
@@ -468,6 +480,11 @@ function PlayPage() {
           />
         </div>
 
+        {notice && (
+          <p className={notice.kind === "success" ? "success-text" : "info-text"}>
+            {notice.message}
+          </p>
+        )}
         {lastError && <p className="error-text">ERROR: {lastError}</p>}
       </section>
 
@@ -539,4 +556,3 @@ function StatusBadge({ label, value }: { label: string; value: string }) {
     </div>
   );
 }
-

@@ -3,10 +3,16 @@ package session
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
+)
+
+var (
+	// ErrNicknameTaken은 이미 다른 플레이어가 사용하는 닉네임일 때 반환된다.
+	ErrNicknameTaken = errors.New("nickname is already taken")
 )
 
 // PlayerSession은 플레이어의 인증 세션 정보를 나타낸다.
@@ -19,9 +25,11 @@ type PlayerSession struct {
 
 // Store는 메모리 기반 세션 저장소다.
 type Store struct {
-	mu       sync.RWMutex
-	sessions map[string]PlayerSession
-	now      func() time.Time
+	mu              sync.RWMutex
+	sessions        map[string]PlayerSession
+	nicknameOwners  map[string]string
+	playerNicknames map[string]string
+	now             func() time.Time
 }
 
 // NewStore는 세션 저장소를 생성한다.
@@ -31,8 +39,10 @@ func NewStore(now func() time.Time) *Store {
 	}
 
 	return &Store{
-		sessions: make(map[string]PlayerSession),
-		now:      now,
+		sessions:        make(map[string]PlayerSession),
+		nicknameOwners:  make(map[string]string),
+		playerNicknames: make(map[string]string),
+		now:             now,
 	}
 }
 
@@ -61,6 +71,19 @@ func (s *Store) Create(playerID, nickname string, ttl time.Duration) (PlayerSess
 	}
 
 	s.mu.Lock()
+	canonicalNickname := canonicalizeNickname(session.Nickname)
+	if ownerPlayerID, exists := s.nicknameOwners[canonicalNickname]; exists && ownerPlayerID != playerID {
+		s.mu.Unlock()
+		return PlayerSession{}, ErrNicknameTaken
+	}
+
+	// 동일 플레이어의 닉네임 변경이 발생하면 이전 인덱스를 정리한다.
+	if previousCanonical, exists := s.playerNicknames[playerID]; exists && previousCanonical != canonicalNickname {
+		delete(s.nicknameOwners, previousCanonical)
+	}
+
+	s.nicknameOwners[canonicalNickname] = playerID
+	s.playerNicknames[playerID] = canonicalNickname
 	s.sessions[sessionID] = session
 	s.mu.Unlock()
 
@@ -117,4 +140,8 @@ func normalizeNickname(input, playerID string) string {
 		suffix = suffix[len(suffix)-6:]
 	}
 	return "Guest-" + suffix
+}
+
+func canonicalizeNickname(input string) string {
+	return strings.ToLower(strings.TrimSpace(input))
 }

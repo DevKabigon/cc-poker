@@ -171,16 +171,33 @@ func buildEventStore(cfg config.Config, logger *log.Logger) store.EventStore {
 }
 
 func buildAuthVerifier(cfg config.Config, logger *log.Logger) auth.Verifier {
-	verifier := auth.NewSupabaseVerifier(auth.SupabaseConfig{
-		Enabled: cfg.SupabaseEnabled,
+	enabled := cfg.SupabaseEnabled
+	hasURL := strings.TrimSpace(cfg.SupabaseURL) != ""
+	hasKey := strings.TrimSpace(cfg.SupabaseAnonKey) != ""
+
+	logger.Printf(
+		"supabase auth config: enabled=%t url_set=%t anon_key_set=%t timeout_ms=%d",
+		enabled,
+		hasURL,
+		hasKey,
+		cfg.SupabaseTimeout.Milliseconds(),
+	)
+
+	if !enabled {
+		logger.Printf("supabase auth verifier disabled: CC_POKER_SUPABASE_ENABLED=false")
+		return auth.NewSupabaseVerifier(auth.SupabaseConfig{Enabled: false})
+	}
+	if !hasURL || !hasKey {
+		logger.Printf("supabase auth verifier disabled: missing URL or anon key")
+		return auth.NewSupabaseVerifier(auth.SupabaseConfig{Enabled: false})
+	}
+
+	return auth.NewSupabaseVerifier(auth.SupabaseConfig{
+		Enabled: true,
 		URL:     cfg.SupabaseURL,
 		AnonKey: cfg.SupabaseAnonKey,
 		Timeout: cfg.SupabaseTimeout,
 	})
-	if !cfg.SupabaseEnabled {
-		logger.Printf("supabase auth verifier disabled")
-	}
-	return verifier
 }
 
 func (a *App) seedInitialData() {
@@ -233,12 +250,21 @@ func (a *App) handleGuestSession(w http.ResponseWriter, r *http.Request) {
 
 	created, err := a.sessions.CreateGuest(req.Nickname, a.cfg.SessionTTL)
 	if err != nil {
+		if errors.Is(err, session.ErrNicknameTaken) {
+			http.Error(w, "nickname is already taken", http.StatusConflict)
+			return
+		}
 		a.logger.Printf("failed to create guest session: %v", err)
 		http.Error(w, "failed to create session", http.StatusInternalServerError)
 		return
 	}
 
-	a.persistSession(created)
+	if err := a.persistSession(created); err != nil {
+		a.sessions.Delete(created.SessionID)
+		statusCode, message := nicknameErrorToHTTP(err)
+		http.Error(w, message, statusCode)
+		return
+	}
 	a.ensureWallet(created.PlayerID, a.cfg.GuestWalletInitial)
 	a.setSessionCookie(w, created)
 	writeJSON(w, http.StatusCreated, guestSessionResponse{
@@ -281,12 +307,21 @@ func (a *App) handleAuthExchange(w http.ResponseWriter, r *http.Request) {
 	nickname := resolveAuthNickname(req.Nickname, authUser)
 	created, err := a.sessions.Create(playerID, nickname, a.cfg.SessionTTL)
 	if err != nil {
+		if errors.Is(err, session.ErrNicknameTaken) {
+			http.Error(w, "nickname is already taken", http.StatusConflict)
+			return
+		}
 		a.logger.Printf("failed to create auth session: %v", err)
 		http.Error(w, "failed to create session", http.StatusInternalServerError)
 		return
 	}
 
-	a.persistSession(created)
+	if err := a.persistSession(created); err != nil {
+		a.sessions.Delete(created.SessionID)
+		statusCode, message := nicknameErrorToHTTP(err)
+		http.Error(w, message, statusCode)
+		return
+	}
 	a.ensureWallet(created.PlayerID, a.cfg.AuthWalletInitial)
 	a.setSessionCookie(w, created)
 
@@ -638,9 +673,9 @@ func (a *App) persistSnapshot(snapshot table.Snapshot, seq uint64) {
 	}
 }
 
-func (a *App) persistSession(playerSession session.PlayerSession) {
+func (a *App) persistSession(playerSession session.PlayerSession) error {
 	if !a.cfg.PostgresEnabled {
-		return
+		return nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.PostgresTimeout)
@@ -648,7 +683,9 @@ func (a *App) persistSession(playerSession session.PlayerSession) {
 
 	if err := a.eventStore.SaveSession(ctx, playerSession); err != nil {
 		a.logger.Printf("failed to persist session: player=%s session=%s err=%v", playerSession.PlayerID, playerSession.SessionID, err)
+		return err
 	}
+	return nil
 }
 
 func (a *App) ensureWallet(playerID string, initialBalance int64) {
@@ -846,6 +883,15 @@ func authErrorToHTTP(err error) (int, string) {
 	}
 }
 
+func nicknameErrorToHTTP(err error) (int, string) {
+	switch {
+	case errors.Is(err, session.ErrNicknameTaken), errors.Is(err, store.ErrNicknameTaken):
+		return http.StatusConflict, "nickname is already taken"
+	default:
+		return http.StatusInternalServerError, "failed to create session"
+	}
+}
+
 func authUserToPlayerID(authUserID string) string {
 	trimmed := strings.TrimSpace(authUserID)
 	normalized := strings.ReplaceAll(trimmed, "-", "")
@@ -860,6 +906,7 @@ func resolveAuthNickname(requestNickname string, authUser auth.User) string {
 		requestNickname,
 		authUser.Nickname,
 		emailLocalPart(authUser.Email),
+		fallbackAuthNickname(authUser.UserID),
 	}
 	for _, candidate := range candidates {
 		trimmed := strings.TrimSpace(candidate)
@@ -873,7 +920,7 @@ func resolveAuthNickname(requestNickname string, authUser auth.User) string {
 		}
 		return trimmed
 	}
-	return "User"
+	return "User-000001"
 }
 
 func emailLocalPart(email string) string {
@@ -887,6 +934,18 @@ func emailLocalPart(email string) string {
 		return ""
 	}
 	return trimmed[:atIndex]
+}
+
+func fallbackAuthNickname(userID string) string {
+	trimmed := strings.TrimSpace(userID)
+	trimmed = strings.ReplaceAll(trimmed, "-", "")
+	if len(trimmed) >= 6 {
+		return "User-" + trimmed[:6]
+	}
+	if trimmed != "" {
+		return "User-" + trimmed
+	}
+	return ""
 }
 
 func writeJSON(w http.ResponseWriter, statusCode int, payload any) {

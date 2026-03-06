@@ -14,6 +14,7 @@ import (
 
 	"github.com/DevKabigon/cc-poker/backend/internal/session"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -344,6 +345,9 @@ func (s *postgresEventStore) SaveSession(ctx context.Context, playerSession sess
 		VALUES ($1, $2)
 		ON CONFLICT (id) DO UPDATE SET nickname = EXCLUDED.nickname
 	`, playerSession.PlayerID, playerSession.Nickname); err != nil {
+		if isNicknameUniqueViolation(err) {
+			return ErrNicknameTaken
+		}
 		return fmt.Errorf("failed to upsert user: %w", err)
 	}
 
@@ -361,6 +365,17 @@ func (s *postgresEventStore) SaveSession(ctx context.Context, playerSession sess
 		return fmt.Errorf("failed to commit tx: %w", err)
 	}
 	return nil
+}
+
+func isNicknameUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	if pgErr.Code != "23505" {
+		return false
+	}
+	return strings.Contains(strings.ToLower(pgErr.ConstraintName), "nickname")
 }
 
 // SaveTableEvent는 테이블 이벤트를 append-only로 기록한다.

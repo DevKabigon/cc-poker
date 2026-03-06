@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -100,6 +101,46 @@ func TestGuestSessionSetsCookie(t *testing.T) {
 	}
 }
 
+func TestGuestSessionRejectsDuplicateNickname(t *testing.T) {
+	app := newTestApp()
+	server := httptest.NewServer(app.Handler())
+	defer server.Close()
+
+	firstBody := bytes.NewBufferString(`{"nickname":"UniqueNick01"}`)
+	firstReq, err := http.NewRequest(http.MethodPost, server.URL+"/v1/session/guest", firstBody)
+	if err != nil {
+		t.Fatalf("failed to create first request: %v", err)
+	}
+	firstReq.Header.Set("Content-Type", "application/json")
+
+	firstRes, err := http.DefaultClient.Do(firstReq)
+	if err != nil {
+		t.Fatalf("failed to send first request: %v", err)
+	}
+	defer firstRes.Body.Close()
+
+	if firstRes.StatusCode != http.StatusCreated {
+		t.Fatalf("unexpected first status code: got=%d want=%d", firstRes.StatusCode, http.StatusCreated)
+	}
+
+	secondBody := bytes.NewBufferString(`{"nickname":"UniqueNick01"}`)
+	secondReq, err := http.NewRequest(http.MethodPost, server.URL+"/v1/session/guest", secondBody)
+	if err != nil {
+		t.Fatalf("failed to create second request: %v", err)
+	}
+	secondReq.Header.Set("Content-Type", "application/json")
+
+	secondRes, err := http.DefaultClient.Do(secondReq)
+	if err != nil {
+		t.Fatalf("failed to send second request: %v", err)
+	}
+	defer secondRes.Body.Close()
+
+	if secondRes.StatusCode != http.StatusConflict {
+		t.Fatalf("unexpected second status code: got=%d want=%d", secondRes.StatusCode, http.StatusConflict)
+	}
+}
+
 func TestAuthExchangeRejectsUnverifiedEmail(t *testing.T) {
 	app := newTestAppWithAuthVerifier(fakeAuthVerifier{
 		user: auth.User{
@@ -159,6 +200,52 @@ func TestAuthExchangeSetsCookieAndUsesAuthWalletInitial(t *testing.T) {
 	}
 
 	createBuyInExpectStatus(t, server.URL, cookies[0], "table-1", 2500, http.StatusCreated)
+}
+
+func TestAuthExchangeRejectsDuplicateNickname(t *testing.T) {
+	app := newTestAppWithAuthVerifier(fakeAuthVerifier{
+		user: auth.User{
+			UserID:        "31cf4a14-87f3-4e8a-aee5-174339f3cbf3",
+			Email:         "verified@example.com",
+			EmailVerified: true,
+			Nickname:      "DuplicatedNick",
+		},
+	})
+	server := httptest.NewServer(app.Handler())
+	defer server.Close()
+
+	firstReqBody := bytes.NewBufferString(`{"nickname":"DuplicatedNick"}`)
+	firstReq, err := http.NewRequest(http.MethodPost, server.URL+"/v1/session/guest", firstReqBody)
+	if err != nil {
+		t.Fatalf("failed to create guest request: %v", err)
+	}
+	firstReq.Header.Set("Content-Type", "application/json")
+
+	firstRes, err := http.DefaultClient.Do(firstReq)
+	if err != nil {
+		t.Fatalf("failed to create guest session: %v", err)
+	}
+	defer firstRes.Body.Close()
+	if firstRes.StatusCode != http.StatusCreated {
+		t.Fatalf("unexpected guest status code: got=%d want=%d", firstRes.StatusCode, http.StatusCreated)
+	}
+
+	secondReqBody := bytes.NewBufferString(`{"access_token":"dummy-token","nickname":"DuplicatedNick"}`)
+	secondReq, err := http.NewRequest(http.MethodPost, server.URL+"/v1/auth/exchange", secondReqBody)
+	if err != nil {
+		t.Fatalf("failed to create auth exchange request: %v", err)
+	}
+	secondReq.Header.Set("Content-Type", "application/json")
+
+	secondRes, err := http.DefaultClient.Do(secondReq)
+	if err != nil {
+		t.Fatalf("failed to call auth exchange endpoint: %v", err)
+	}
+	defer secondRes.Body.Close()
+
+	if secondRes.StatusCode != http.StatusConflict {
+		t.Fatalf("unexpected auth exchange status code: got=%d want=%d", secondRes.StatusCode, http.StatusConflict)
+	}
 }
 
 func TestGuestWalletInitialIs2000(t *testing.T) {
@@ -411,7 +498,9 @@ func mustRawMessage(t *testing.T, payload any) json.RawMessage {
 func issueGuestCookie(t *testing.T, baseURL string) *http.Cookie {
 	t.Helper()
 
-	reqBody := bytes.NewBufferString(`{"nickname":"Kabigon"}`)
+	next := atomic.AddUint64(&testGuestNicknameSeq, 1)
+	nickname := "Kabigon-" + strconv.FormatUint(next, 10)
+	reqBody := bytes.NewBufferString(`{"nickname":"` + nickname + `"}`)
 	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/session/guest", reqBody)
 	if err != nil {
 		t.Fatalf("failed to create request: %v", err)
@@ -435,6 +524,8 @@ func issueGuestCookie(t *testing.T, baseURL string) *http.Cookie {
 
 	return cookies[0]
 }
+
+var testGuestNicknameSeq uint64
 
 func createBuyIn(t *testing.T, baseURL string, cookie *http.Cookie, tableID string, amount int64) {
 	createBuyInExpectStatus(t, baseURL, cookie, tableID, amount, http.StatusCreated)

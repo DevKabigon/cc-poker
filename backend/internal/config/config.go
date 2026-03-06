@@ -59,6 +59,8 @@ type Config struct {
 
 // Load는 환경변수 기반 설정을 읽고 기본값을 채워 반환한다.
 func Load() Config {
+	loadDotEnvIfPresent()
+
 	return Config{
 		HTTPAddr:           getenv("CC_POKER_BACKEND_ADDR", defaultHTTPAddr),
 		SessionCookieName:  getenv("CC_POKER_SESSION_COOKIE_NAME", defaultSessionCookieName),

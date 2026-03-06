@@ -179,6 +179,18 @@ button.outline {
   font-weight: 700;
 }
 
+.success-text {
+  margin-top: 12px;
+  color: #9df7c2;
+  font-weight: 700;
+}
+
+.info-text {
+  margin-top: 12px;
+  color: #bde8ff;
+  font-weight: 700;
+}
+
 .layout {
   margin-top: 16px;
   display: grid;

@@ -34,6 +34,8 @@ type BuyInReceipt struct {
 }
 
 var (
+	// ErrNicknameTaken은 이미 사용 중인 닉네임으로 저장하려고 할 때 반환된다.
+	ErrNicknameTaken = errors.New("nickname is already taken")
 	// ErrTableNotFound는 테이블이 존재하지 않을 때 반환된다.
 	ErrTableNotFound = errors.New("table not found")
 	// ErrInvalidBuyInAmount는 바이인 금액이 룸 규칙을 벗어났을 때 반환된다.
