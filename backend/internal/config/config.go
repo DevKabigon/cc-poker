@@ -19,6 +19,10 @@ const (
 	defaultRedisKeyPrefix    = "cc_poker"
 	defaultSnapshotEnabled   = true
 	defaultSnapshotTimeout   = 500 * time.Millisecond
+	defaultPostgresEnabled   = true
+	defaultPostgresDSN       = "postgres://ccpoker:ccpoker@127.0.0.1:5432/ccpoker?sslmode=disable"
+	defaultPostgresMaxConns  = 10
+	defaultPostgresTimeout   = 800 * time.Millisecond
 )
 
 // Config는 백엔드 서버 실행에 필요한 설정값 묶음이다.
@@ -35,6 +39,10 @@ type Config struct {
 	RedisKeyPrefix    string
 	SnapshotEnabled   bool
 	SnapshotTimeout   time.Duration
+	PostgresEnabled   bool
+	PostgresDSN       string
+	PostgresMaxConns  int
+	PostgresTimeout   time.Duration
 }
 
 // Load는 환경변수 기반 설정을 읽고 기본값을 채워 반환한다.
@@ -52,6 +60,10 @@ func Load() Config {
 		RedisKeyPrefix:    getenv("CC_POKER_REDIS_KEY_PREFIX", defaultRedisKeyPrefix),
 		SnapshotEnabled:   getenvBool("CC_POKER_SNAPSHOT_ENABLED", defaultSnapshotEnabled),
 		SnapshotTimeout:   time.Duration(getenvInt("CC_POKER_SNAPSHOT_TIMEOUT_MS", int(defaultSnapshotTimeout.Milliseconds()))) * time.Millisecond,
+		PostgresEnabled:   getenvBool("CC_POKER_POSTGRES_ENABLED", defaultPostgresEnabled),
+		PostgresDSN:       getenv("CC_POKER_POSTGRES_DSN", defaultPostgresDSN),
+		PostgresMaxConns:  getenvInt("CC_POKER_POSTGRES_MAX_CONNS", defaultPostgresMaxConns),
+		PostgresTimeout:   time.Duration(getenvInt("CC_POKER_POSTGRES_TIMEOUT_MS", int(defaultPostgresTimeout.Milliseconds()))) * time.Millisecond,
 	}
 }
 
@@ -115,3 +127,5 @@ func parseAllowedOrigins(raw string) map[string]struct{} {
 
 	return out
 }
+
+

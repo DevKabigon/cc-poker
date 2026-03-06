@@ -45,6 +45,7 @@ type App struct {
 	sessions      *session.Store
 	tables        *table.Manager
 	snapshotStore store.TableSnapshotStore
+	eventStore    store.EventStore
 	hub           *wsHub
 	mux           *http.ServeMux
 	upgrader      websocket.Upgrader
@@ -64,12 +65,15 @@ func newWithSnapshotStore(cfg config.Config, logger *log.Logger, snapshotStore s
 		snapshotStore = buildSnapshotStore(cfg, logger)
 	}
 
+	eventStore := buildEventStore(cfg, logger)
+
 	app := &App{
 		cfg:           cfg,
 		logger:        logger,
 		sessions:      session.NewStore(nil),
 		tables:        table.NewManager(cfg.DefaultTableID),
 		snapshotStore: snapshotStore,
+		eventStore:    eventStore,
 		hub:           newWSHub(),
 		mux:           http.NewServeMux(),
 	}
@@ -99,6 +103,22 @@ func buildSnapshotStore(cfg config.Config, logger *log.Logger) store.TableSnapsh
 		return store.NewNoopSnapshotStore()
 	}
 	return snapshotStore
+}
+
+func buildEventStore(cfg config.Config, logger *log.Logger) store.EventStore {
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.PostgresTimeout)
+	defer cancel()
+
+	eventStore, err := store.NewEventStore(ctx, store.PostgresEventStoreConfig{
+		Enabled:  cfg.PostgresEnabled,
+		DSN:      cfg.PostgresDSN,
+		MaxConns: cfg.PostgresMaxConns,
+	})
+	if err != nil {
+		logger.Printf("event store disabled: %v", err)
+		return store.NewNoopEventStore()
+	}
+	return eventStore
 }
 
 // Handler는 앱의 HTTP 핸들러를 반환한다.
@@ -144,6 +164,7 @@ func (a *App) handleGuestSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	a.persistSession(created)
 	a.setSessionCookie(w, created)
 	writeJSON(w, http.StatusCreated, guestSessionResponse{
 		PlayerID:  created.PlayerID,
@@ -230,6 +251,7 @@ func (a *App) closeClient(client *wsClient) {
 		if err == nil {
 			a.broadcastSnapshot(tableID, snapshot, seq)
 			a.persistSnapshot(snapshot, seq)
+			a.persistTableEvent("disconnect_leave", client.PlayerID(), snapshot, seq)
 		}
 	}
 
@@ -258,6 +280,7 @@ func (a *App) handleJoinTableEvent(client *wsClient, payload json.RawMessage) ([
 		if leaveErr == nil {
 			a.broadcastSnapshot(currentTableID, previousSnapshot, previousSeq)
 			a.persistSnapshot(previousSnapshot, previousSeq)
+			a.persistTableEvent("switch_leave", client.PlayerID(), previousSnapshot, previousSeq)
 		}
 	}
 
@@ -270,6 +293,7 @@ func (a *App) handleJoinTableEvent(client *wsClient, payload json.RawMessage) ([
 	client.SetTableState(tableID, true)
 	envelope := a.broadcastSnapshot(tableID, snapshot, seq)
 	a.persistSnapshot(snapshot, seq)
+	a.persistTableEvent("join_table", client.PlayerID(), snapshot, seq)
 	return []protocol.ServerEnvelope{envelope}, nil
 }
 
@@ -295,6 +319,7 @@ func (a *App) handleLeaveTableEvent(client *wsClient, payload json.RawMessage) (
 	client.SetTableState(tableID, false)
 	envelope := a.broadcastSnapshot(tableID, snapshot, seq)
 	a.persistSnapshot(snapshot, seq)
+	a.persistTableEvent("leave_table", client.PlayerID(), snapshot, seq)
 	return []protocol.ServerEnvelope{envelope}, nil
 }
 
@@ -323,34 +348,13 @@ func (a *App) sendErrorNotice(client *wsClient, code, message string) ([]protoco
 }
 
 func (a *App) newSnapshotEnvelope(snapshot table.Snapshot, seq uint64) protocol.ServerEnvelope {
-	players := make([]protocol.SnapshotPlayer, 0, len(snapshot.Players))
-	for _, player := range snapshot.Players {
-		players = append(players, protocol.SnapshotPlayer{
-			PlayerID:  player.PlayerID,
-			Nickname:  player.Nickname,
-			SeatIndex: player.SeatIndex,
-		})
-	}
-
-	tableState := "waiting"
-	if snapshot.CanStart {
-		tableState = "ready"
-	}
-
 	return protocol.ServerEnvelope{
 		EventVersion: wsEventVersion,
 		EventType:    "table_snapshot",
 		TableID:      snapshot.TableID,
 		Seq:          seq,
 		SentAt:       time.Now().UTC().Format(time.RFC3339),
-		Payload: protocol.TableSnapshotPayload{
-			TableState:        tableState,
-			MaxPlayers:        snapshot.MaxPlayers,
-			MinPlayersToStart: snapshot.MinPlayersToStart,
-			ActivePlayers:     snapshot.ActivePlayers,
-			CanStart:          snapshot.CanStart,
-			Players:           players,
-		},
+		Payload:      snapshotPayload(snapshot),
 	}
 }
 
@@ -406,6 +410,70 @@ func (a *App) persistSnapshot(snapshot table.Snapshot, seq uint64) {
 
 	if err := a.snapshotStore.Save(ctx, snapshot, seq); err != nil {
 		a.logger.Printf("failed to persist table snapshot: table=%s seq=%d err=%v", snapshot.TableID, seq, err)
+	}
+}
+
+func (a *App) persistSession(playerSession session.PlayerSession) {
+	if !a.cfg.PostgresEnabled {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.PostgresTimeout)
+	defer cancel()
+
+	if err := a.eventStore.SaveSession(ctx, playerSession); err != nil {
+		a.logger.Printf("failed to persist session: player=%s session=%s err=%v", playerSession.PlayerID, playerSession.SessionID, err)
+	}
+}
+
+func (a *App) persistTableEvent(eventType, playerID string, snapshot table.Snapshot, seq uint64) {
+	if !a.cfg.PostgresEnabled {
+		return
+	}
+
+	payload, err := json.Marshal(snapshotPayload(snapshot))
+	if err != nil {
+		a.logger.Printf("failed to marshal table event payload: table=%s seq=%d err=%v", snapshot.TableID, seq, err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.PostgresTimeout)
+	defer cancel()
+
+	if err := a.eventStore.SaveTableEvent(ctx, store.TableEvent{
+		TableID:   snapshot.TableID,
+		Seq:       seq,
+		EventType: eventType,
+		PlayerID:  playerID,
+		Payload:   payload,
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		a.logger.Printf("failed to persist table event: table=%s seq=%d event=%s err=%v", snapshot.TableID, seq, eventType, err)
+	}
+}
+
+func snapshotPayload(snapshot table.Snapshot) protocol.TableSnapshotPayload {
+	players := make([]protocol.SnapshotPlayer, 0, len(snapshot.Players))
+	for _, player := range snapshot.Players {
+		players = append(players, protocol.SnapshotPlayer{
+			PlayerID:  player.PlayerID,
+			Nickname:  player.Nickname,
+			SeatIndex: player.SeatIndex,
+		})
+	}
+
+	tableState := "waiting"
+	if snapshot.CanStart {
+		tableState = "ready"
+	}
+
+	return protocol.TableSnapshotPayload{
+		TableState:        tableState,
+		MaxPlayers:        snapshot.MaxPlayers,
+		MinPlayersToStart: snapshot.MinPlayersToStart,
+		ActivePlayers:     snapshot.ActivePlayers,
+		CanStart:          snapshot.CanStart,
+		Players:           players,
 	}
 }
 
