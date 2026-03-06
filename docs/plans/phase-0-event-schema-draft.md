@@ -14,6 +14,7 @@
 {
   "event_version": 1,
   "event_type": "player_action",
+  "request_id": "req_001",
   "table_id": "tbl_123",
   "hand_id": "h_456",
   "seq": 1024,
@@ -25,6 +26,7 @@
 ## 필드 정의
 - `event_version`: 프로토콜 버전
 - `event_type`: 이벤트 이름
+- `request_id`: 클라이언트 요청 멱등 처리 식별자 (클라이언트 -> 서버 이벤트에서 사용)
 - `table_id`: 테이블 식별자
 - `hand_id`: 핸드 식별자 (로비/입장 이벤트는 nullable 가능)
 - `seq`: 테이블 단위 단조 증가 시퀀스

@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -13,19 +14,35 @@ import (
 
 	"github.com/DevKabigon/cc-poker/backend/internal/config"
 	"github.com/DevKabigon/cc-poker/backend/internal/protocol"
+	"github.com/DevKabigon/cc-poker/backend/internal/store"
 	"github.com/DevKabigon/cc-poker/backend/internal/table"
 	"github.com/gorilla/websocket"
 )
 
 func newTestApp() *App {
-	return New(config.Config{
+	return newWithSnapshotStore(config.Config{
 		HTTPAddr:          ":0",
 		SessionCookieName: "cc_poker_session",
 		SessionTTL:        time.Hour,
 		CookieSecure:      false,
 		AllowedOrigins:    map[string]struct{}{},
 		DefaultTableID:    "table-1",
-	}, log.New(io.Discard, "", 0))
+		SnapshotEnabled:   false,
+		SnapshotTimeout:   time.Second,
+	}, log.New(io.Discard, "", 0), nil)
+}
+
+func newTestAppWithStore(snapshotStore store.TableSnapshotStore) *App {
+	return newWithSnapshotStore(config.Config{
+		HTTPAddr:          ":0",
+		SessionCookieName: "cc_poker_session",
+		SessionTTL:        time.Hour,
+		CookieSecure:      false,
+		AllowedOrigins:    map[string]struct{}{},
+		DefaultTableID:    "table-1",
+		SnapshotEnabled:   true,
+		SnapshotTimeout:   time.Second,
+	}, log.New(io.Discard, "", 0), snapshotStore)
 }
 
 func TestGuestSessionSetsCookie(t *testing.T) {
@@ -160,6 +177,64 @@ func TestWebSocketBroadcastsSnapshotToOtherClientsOnJoin(t *testing.T) {
 	}
 }
 
+func TestWebSocketJoinIsIdempotentByRequestID(t *testing.T) {
+	app := newTestApp()
+	server := httptest.NewServer(app.Handler())
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
+	cookie := issueGuestCookie(t, server.URL)
+	conn := dialWSWithCookie(t, wsURL, cookie)
+	defer conn.Close()
+
+	_ = readSnapshotEnvelope(t, conn)
+
+	sendJoinTableWithRequestID(t, conn, "table-1", "req-join-001")
+	first := readSnapshotEnvelope(t, conn)
+	if first.Payload.ActivePlayers != 1 {
+		t.Fatalf("unexpected active players after first join: got=%d want=1", first.Payload.ActivePlayers)
+	}
+
+	sendJoinTableWithRequestID(t, conn, "table-1", "req-join-001")
+	second := readSnapshotEnvelope(t, conn)
+	if second.Payload.ActivePlayers != 1 {
+		t.Fatalf("unexpected active players after idempotent replay: got=%d want=1", second.Payload.ActivePlayers)
+	}
+	if second.Envelope.Seq != first.Envelope.Seq {
+		t.Fatalf("expected duplicated request to replay same seq: first=%d second=%d", first.Envelope.Seq, second.Envelope.Seq)
+	}
+}
+
+func TestAppRestoresSnapshotFromStore(t *testing.T) {
+	fakeStore := &fakeSnapshotStore{
+		loadSnapshot: table.Snapshot{
+			TableID:           "table-1",
+			MaxPlayers:        table.MaxPlayers,
+			MinPlayersToStart: table.MinPlayersToStart,
+			ActivePlayers:     1,
+			CanStart:          false,
+			Players: []table.Player{
+				{PlayerID: "ply_restored", Nickname: "Restored", SeatIndex: 2},
+			},
+		},
+		loadSeq:   7,
+		loadFound: true,
+	}
+
+	app := newTestAppWithStore(fakeStore)
+	snapshot, seq := app.tables.Snapshot("table-1")
+
+	if seq != 7 {
+		t.Fatalf("unexpected restored seq: got=%d want=7", seq)
+	}
+	if snapshot.ActivePlayers != 1 {
+		t.Fatalf("unexpected restored active players: got=%d want=1", snapshot.ActivePlayers)
+	}
+	if len(snapshot.Players) != 1 || snapshot.Players[0].SeatIndex != 2 {
+		t.Fatalf("unexpected restored players payload")
+	}
+}
+
 func dialWSWithCookie(t *testing.T, wsURL string, cookie *http.Cookie) *websocket.Conn {
 	t.Helper()
 
@@ -174,10 +249,15 @@ func dialWSWithCookie(t *testing.T, wsURL string, cookie *http.Cookie) *websocke
 }
 
 func sendJoinTable(t *testing.T, conn *websocket.Conn, tableID string) {
+	sendJoinTableWithRequestID(t, conn, tableID, "")
+}
+
+func sendJoinTableWithRequestID(t *testing.T, conn *websocket.Conn, tableID, requestID string) {
 	t.Helper()
 
 	event := protocol.ClientEnvelope{
 		EventType: "join_table",
+		RequestID: requestID,
 		Payload:   mustRawMessage(t, protocol.JoinTablePayload{TableID: tableID}),
 	}
 
@@ -188,6 +268,15 @@ func sendJoinTable(t *testing.T, conn *websocket.Conn, tableID string) {
 }
 
 func readSnapshot(t *testing.T, conn *websocket.Conn) protocol.TableSnapshotPayload {
+	return readSnapshotEnvelope(t, conn).Payload
+}
+
+type snapshotEnvelopeResult struct {
+	Envelope protocol.ServerEnvelopeRaw
+	Payload  protocol.TableSnapshotPayload
+}
+
+func readSnapshotEnvelope(t *testing.T, conn *websocket.Conn) snapshotEnvelopeResult {
 	t.Helper()
 
 	var envelope protocol.ServerEnvelopeRaw
@@ -205,7 +294,10 @@ func readSnapshot(t *testing.T, conn *websocket.Conn) protocol.TableSnapshotPayl
 		t.Fatalf("failed to decode snapshot payload: %v", err)
 	}
 
-	return snapshot
+	return snapshotEnvelopeResult{
+		Envelope: envelope,
+		Payload:  snapshot,
+	}
 }
 
 func mustRawMessage(t *testing.T, payload any) json.RawMessage {
@@ -244,4 +336,20 @@ func issueGuestCookie(t *testing.T, baseURL string) *http.Cookie {
 	}
 
 	return cookies[0]
+}
+
+type fakeSnapshotStore struct {
+	loadSnapshot table.Snapshot
+	loadSeq      uint64
+	loadFound    bool
+	loadErr      error
+	saveErr      error
+}
+
+func (f *fakeSnapshotStore) Save(context.Context, table.Snapshot, uint64) error {
+	return f.saveErr
+}
+
+func (f *fakeSnapshotStore) Load(context.Context, string) (table.Snapshot, uint64, bool, error) {
+	return f.loadSnapshot, f.loadSeq, f.loadFound, f.loadErr
 }

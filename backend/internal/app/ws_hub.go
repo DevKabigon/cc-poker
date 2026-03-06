@@ -10,6 +10,16 @@ import (
 )
 
 const wsWriteTimeout = 5 * time.Second
+const (
+	maxIdempotencyEntries = 128
+	idempotencyCacheTTL   = 10 * time.Minute
+)
+
+type cachedResponse struct {
+	EventType string
+	Envelopes []protocol.ServerEnvelope
+	StoredAt  time.Time
+}
 
 // wsClient는 단일 WebSocket 연결과 플레이어 컨텍스트를 함께 관리한다.
 type wsClient struct {
@@ -20,13 +30,19 @@ type wsClient struct {
 	stateMu sync.RWMutex
 	tableID string
 	seated  bool
+
+	requestMu    sync.Mutex
+	requestOrder []string
+	requestCache map[string]cachedResponse
 }
 
 func newWSClient(conn *websocket.Conn, player session.PlayerSession, initialTableID string) *wsClient {
 	return &wsClient{
-		conn:    conn,
-		player:  player,
-		tableID: initialTableID,
+		conn:         conn,
+		player:       player,
+		tableID:      initialTableID,
+		requestOrder: make([]string, 0, maxIdempotencyEntries),
+		requestCache: make(map[string]cachedResponse),
 	}
 }
 
@@ -74,6 +90,81 @@ func (c *wsClient) SetTableState(tableID string, seated bool) {
 
 func (c *wsClient) Close() error {
 	return c.conn.Close()
+}
+
+// ReplayIdempotent는 같은 request_id가 이미 처리된 경우 이전 응답을 재전송한다.
+func (c *wsClient) ReplayIdempotent(requestID, eventType string) (bool, error) {
+	if requestID == "" {
+		return false, nil
+	}
+
+	c.requestMu.Lock()
+	c.evictExpiredLocked(time.Now())
+
+	cached, ok := c.requestCache[requestID]
+	if !ok || cached.EventType != eventType {
+		c.requestMu.Unlock()
+		return false, nil
+	}
+
+	envelopes := append([]protocol.ServerEnvelope(nil), cached.Envelopes...)
+	c.requestMu.Unlock()
+
+	for _, envelope := range envelopes {
+		if err := c.WriteEvent(envelope); err != nil {
+			return true, err
+		}
+	}
+	return true, nil
+}
+
+// StoreIdempotent는 request_id와 처리 결과를 캐시에 저장한다.
+func (c *wsClient) StoreIdempotent(requestID, eventType string, responses []protocol.ServerEnvelope) {
+	if requestID == "" || len(responses) == 0 {
+		return
+	}
+
+	c.requestMu.Lock()
+	defer c.requestMu.Unlock()
+
+	c.evictExpiredLocked(time.Now())
+	if _, exists := c.requestCache[requestID]; exists {
+		return
+	}
+
+	c.requestCache[requestID] = cachedResponse{
+		EventType: eventType,
+		Envelopes: append([]protocol.ServerEnvelope(nil), responses...),
+		StoredAt:  time.Now(),
+	}
+	c.requestOrder = append(c.requestOrder, requestID)
+
+	for len(c.requestOrder) > maxIdempotencyEntries {
+		oldestID := c.requestOrder[0]
+		c.requestOrder = c.requestOrder[1:]
+		delete(c.requestCache, oldestID)
+	}
+}
+
+func (c *wsClient) evictExpiredLocked(now time.Time) {
+	if len(c.requestOrder) == 0 {
+		return
+	}
+
+	filtered := c.requestOrder[:0]
+	for _, requestID := range c.requestOrder {
+		cached, exists := c.requestCache[requestID]
+		if !exists {
+			continue
+		}
+
+		if now.Sub(cached.StoredAt) > idempotencyCacheTTL {
+			delete(c.requestCache, requestID)
+			continue
+		}
+		filtered = append(filtered, requestID)
+	}
+	c.requestOrder = filtered
 }
 
 // wsHub는 현재 접속 중인 WS 클라이언트 집합을 관리한다.

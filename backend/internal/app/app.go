@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"github.com/DevKabigon/cc-poker/backend/internal/config"
 	"github.com/DevKabigon/cc-poker/backend/internal/protocol"
 	"github.com/DevKabigon/cc-poker/backend/internal/session"
+	"github.com/DevKabigon/cc-poker/backend/internal/store"
 	"github.com/DevKabigon/cc-poker/backend/internal/table"
 	"github.com/gorilla/websocket"
 )
@@ -38,36 +40,65 @@ type healthResponse struct {
 
 // App은 HTTP/WS 엔드포인트와 도메인 서비스를 조합한 애플리케이션 루트다.
 type App struct {
-	cfg      config.Config
-	logger   *log.Logger
-	sessions *session.Store
-	tables   *table.Manager
-	hub      *wsHub
-	mux      *http.ServeMux
-	upgrader websocket.Upgrader
+	cfg           config.Config
+	logger        *log.Logger
+	sessions      *session.Store
+	tables        *table.Manager
+	snapshotStore store.TableSnapshotStore
+	hub           *wsHub
+	mux           *http.ServeMux
+	upgrader      websocket.Upgrader
 }
 
 // New는 앱 인스턴스를 초기화하고 라우트를 구성한다.
 func New(cfg config.Config, logger *log.Logger) *App {
+	return newWithSnapshotStore(cfg, logger, nil)
+}
+
+func newWithSnapshotStore(cfg config.Config, logger *log.Logger, snapshotStore store.TableSnapshotStore) *App {
 	if logger == nil {
 		logger = log.New(os.Stdout, "", log.LstdFlags|log.LUTC)
 	}
 
+	if snapshotStore == nil {
+		snapshotStore = buildSnapshotStore(cfg, logger)
+	}
+
 	app := &App{
-		cfg:      cfg,
-		logger:   logger,
-		sessions: session.NewStore(nil),
-		tables:   table.NewManager(cfg.DefaultTableID),
-		hub:      newWSHub(),
-		mux:      http.NewServeMux(),
+		cfg:           cfg,
+		logger:        logger,
+		sessions:      session.NewStore(nil),
+		tables:        table.NewManager(cfg.DefaultTableID),
+		snapshotStore: snapshotStore,
+		hub:           newWSHub(),
+		mux:           http.NewServeMux(),
 	}
 
 	app.upgrader = websocket.Upgrader{
 		CheckOrigin: app.checkOrigin,
 	}
+	app.restoreSnapshot(cfg.DefaultTableID)
 	app.registerRoutes()
 
 	return app
+}
+
+func buildSnapshotStore(cfg config.Config, logger *log.Logger) store.TableSnapshotStore {
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.SnapshotTimeout)
+	defer cancel()
+
+	snapshotStore, err := store.NewSnapshotStore(ctx, store.RedisSnapshotConfig{
+		Enabled:   cfg.SnapshotEnabled,
+		Addr:      cfg.RedisAddr,
+		Password:  cfg.RedisPassword,
+		DB:        cfg.RedisDB,
+		KeyPrefix: cfg.RedisKeyPrefix,
+	})
+	if err != nil {
+		logger.Printf("snapshot store disabled: %v", err)
+		return store.NewNoopSnapshotStore()
+	}
+	return snapshotStore
 }
 
 // Handler는 앱의 HTTP 핸들러를 반환한다.
@@ -145,7 +176,8 @@ func (a *App) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer a.closeClient(client)
 
 	snapshot, seq := a.tables.Snapshot(client.CurrentTableID())
-	if err := a.writeSnapshot(client, snapshot, seq); err != nil {
+	initialEnvelope := a.newSnapshotEnvelope(snapshot, seq)
+	if err := a.writeEnvelope(client, initialEnvelope); err != nil {
 		a.logger.Printf("failed to write initial snapshot: %v", err)
 		return
 	}
@@ -159,23 +191,31 @@ func (a *App) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		switch envelope.EventType {
-		case "join_table":
-			if err := a.handleJoinTableEvent(client, envelope.Payload); err != nil {
-				a.logger.Printf("join_table handling error: %v", err)
-				return
-			}
-		case "leave_table":
-			if err := a.handleLeaveTableEvent(client, envelope.Payload); err != nil {
-				a.logger.Printf("leave_table handling error: %v", err)
-				return
-			}
-		default:
-			if err := a.writeErrorNotice(client, "UNSUPPORTED_EVENT", "unsupported event type"); err != nil {
-				a.logger.Printf("failed to send error_notice: %v", err)
-				return
-			}
+		if replayed, err := client.ReplayIdempotent(envelope.RequestID, envelope.EventType); err != nil {
+			a.logger.Printf("failed to replay idempotent response: %v", err)
+			return
+		} else if replayed {
+			continue
 		}
+
+		responses, err := a.dispatchClientEvent(client, envelope)
+		if err != nil {
+			a.logger.Printf("failed to handle websocket event=%s player=%s err=%v", envelope.EventType, playerSession.PlayerID, err)
+			return
+		}
+
+		client.StoreIdempotent(envelope.RequestID, envelope.EventType, responses)
+	}
+}
+
+func (a *App) dispatchClientEvent(client *wsClient, envelope protocol.ClientEnvelope) ([]protocol.ServerEnvelope, error) {
+	switch envelope.EventType {
+	case "join_table":
+		return a.handleJoinTableEvent(client, envelope.Payload)
+	case "leave_table":
+		return a.handleLeaveTableEvent(client, envelope.Payload)
+	default:
+		return a.sendErrorNotice(client, "UNSUPPORTED_EVENT", "unsupported event type")
 	}
 }
 
@@ -189,6 +229,7 @@ func (a *App) closeClient(client *wsClient) {
 
 		if err == nil {
 			a.broadcastSnapshot(tableID, snapshot, seq)
+			a.persistSnapshot(snapshot, seq)
 		}
 	}
 
@@ -196,11 +237,11 @@ func (a *App) closeClient(client *wsClient) {
 	_ = client.Close()
 }
 
-func (a *App) handleJoinTableEvent(client *wsClient, payload json.RawMessage) error {
+func (a *App) handleJoinTableEvent(client *wsClient, payload json.RawMessage) ([]protocol.ServerEnvelope, error) {
 	var joinReq protocol.JoinTablePayload
 	if len(payload) > 0 {
 		if err := json.Unmarshal(payload, &joinReq); err != nil {
-			return a.writeErrorNotice(client, "INVALID_PAYLOAD", "join_table payload is invalid")
+			return a.sendErrorNotice(client, "INVALID_PAYLOAD", "join_table payload is invalid")
 		}
 	}
 
@@ -211,30 +252,32 @@ func (a *App) handleJoinTableEvent(client *wsClient, payload json.RawMessage) er
 	if seated && currentTableID != tableID {
 		previousSnapshot, previousSeq, leaveErr := a.tables.Leave(currentTableID, client.PlayerID())
 		if leaveErr != nil && !errors.Is(leaveErr, table.ErrPlayerNotFound) {
-			return leaveErr
+			return nil, leaveErr
 		}
 		client.SetTableState(currentTableID, false)
 		if leaveErr == nil {
 			a.broadcastSnapshot(currentTableID, previousSnapshot, previousSeq)
+			a.persistSnapshot(previousSnapshot, previousSeq)
 		}
 	}
 
 	snapshot, seq, err := a.tables.Join(tableID, client.PlayerID(), client.Nickname(), joinReq.SeatIndex)
 	if err != nil {
 		code, message := tableErrorToNotice(err)
-		return a.writeErrorNotice(client, code, message)
+		return a.sendErrorNotice(client, code, message)
 	}
 
 	client.SetTableState(tableID, true)
-	a.broadcastSnapshot(tableID, snapshot, seq)
-	return nil
+	envelope := a.broadcastSnapshot(tableID, snapshot, seq)
+	a.persistSnapshot(snapshot, seq)
+	return []protocol.ServerEnvelope{envelope}, nil
 }
 
-func (a *App) handleLeaveTableEvent(client *wsClient, payload json.RawMessage) error {
+func (a *App) handleLeaveTableEvent(client *wsClient, payload json.RawMessage) ([]protocol.ServerEnvelope, error) {
 	var leaveReq protocol.LeaveTablePayload
 	if len(payload) > 0 {
 		if err := json.Unmarshal(payload, &leaveReq); err != nil {
-			return a.writeErrorNotice(client, "INVALID_PAYLOAD", "leave_table payload is invalid")
+			return a.sendErrorNotice(client, "INVALID_PAYLOAD", "leave_table payload is invalid")
 		}
 	}
 
@@ -246,25 +289,40 @@ func (a *App) handleLeaveTableEvent(client *wsClient, payload json.RawMessage) e
 	snapshot, seq, err := a.tables.Leave(tableID, client.PlayerID())
 	if err != nil {
 		code, message := tableErrorToNotice(err)
-		return a.writeErrorNotice(client, code, message)
+		return a.sendErrorNotice(client, code, message)
 	}
 
 	client.SetTableState(tableID, false)
-	a.broadcastSnapshot(tableID, snapshot, seq)
-	return nil
+	envelope := a.broadcastSnapshot(tableID, snapshot, seq)
+	a.persistSnapshot(snapshot, seq)
+	return []protocol.ServerEnvelope{envelope}, nil
 }
 
-func (a *App) broadcastSnapshot(tableID string, snapshot table.Snapshot, seq uint64) {
+func (a *App) broadcastSnapshot(tableID string, snapshot table.Snapshot, seq uint64) protocol.ServerEnvelope {
+	envelope := a.newSnapshotEnvelope(snapshot, seq)
+	a.broadcastEnvelope(tableID, envelope)
+	return envelope
+}
+
+func (a *App) broadcastEnvelope(tableID string, envelope protocol.ServerEnvelope) {
 	for _, client := range a.hub.clientsForTable(tableID) {
-		if err := a.writeSnapshot(client, snapshot, seq); err != nil {
-			a.logger.Printf("failed to broadcast snapshot: player=%s table=%s err=%v", client.PlayerID(), tableID, err)
+		if err := a.writeEnvelope(client, envelope); err != nil {
+			a.logger.Printf("failed to broadcast envelope: player=%s table=%s err=%v", client.PlayerID(), tableID, err)
 			a.hub.remove(client)
 			_ = client.Close()
 		}
 	}
 }
 
-func (a *App) writeSnapshot(client *wsClient, snapshot table.Snapshot, seq uint64) error {
+func (a *App) sendErrorNotice(client *wsClient, code, message string) ([]protocol.ServerEnvelope, error) {
+	envelope := a.newErrorNoticeEnvelope(code, message)
+	if err := a.writeEnvelope(client, envelope); err != nil {
+		return nil, err
+	}
+	return []protocol.ServerEnvelope{envelope}, nil
+}
+
+func (a *App) newSnapshotEnvelope(snapshot table.Snapshot, seq uint64) protocol.ServerEnvelope {
 	players := make([]protocol.SnapshotPlayer, 0, len(snapshot.Players))
 	for _, player := range snapshot.Players {
 		players = append(players, protocol.SnapshotPlayer{
@@ -279,34 +337,76 @@ func (a *App) writeSnapshot(client *wsClient, snapshot table.Snapshot, seq uint6
 		tableState = "ready"
 	}
 
-	payload := protocol.TableSnapshotPayload{
-		TableState:        tableState,
-		MaxPlayers:        snapshot.MaxPlayers,
-		MinPlayersToStart: snapshot.MinPlayersToStart,
-		ActivePlayers:     snapshot.ActivePlayers,
-		CanStart:          snapshot.CanStart,
-		Players:           players,
-	}
-
-	return a.writeWSEvent(client, "table_snapshot", snapshot.TableID, seq, payload)
-}
-
-func (a *App) writeErrorNotice(client *wsClient, code, message string) error {
-	return a.writeWSEvent(client, "error_notice", "", 0, protocol.ErrorNoticePayload{
-		Code:    code,
-		Message: message,
-	})
-}
-
-func (a *App) writeWSEvent(client *wsClient, eventType, tableID string, seq uint64, payload any) error {
-	return client.WriteEvent(protocol.ServerEnvelope{
+	return protocol.ServerEnvelope{
 		EventVersion: wsEventVersion,
-		EventType:    eventType,
-		TableID:      tableID,
+		EventType:    "table_snapshot",
+		TableID:      snapshot.TableID,
 		Seq:          seq,
 		SentAt:       time.Now().UTC().Format(time.RFC3339),
-		Payload:      payload,
-	})
+		Payload: protocol.TableSnapshotPayload{
+			TableState:        tableState,
+			MaxPlayers:        snapshot.MaxPlayers,
+			MinPlayersToStart: snapshot.MinPlayersToStart,
+			ActivePlayers:     snapshot.ActivePlayers,
+			CanStart:          snapshot.CanStart,
+			Players:           players,
+		},
+	}
+}
+
+func (a *App) newErrorNoticeEnvelope(code, message string) protocol.ServerEnvelope {
+	return protocol.ServerEnvelope{
+		EventVersion: wsEventVersion,
+		EventType:    "error_notice",
+		SentAt:       time.Now().UTC().Format(time.RFC3339),
+		Payload: protocol.ErrorNoticePayload{
+			Code:    code,
+			Message: message,
+		},
+	}
+}
+
+func (a *App) writeEnvelope(client *wsClient, envelope protocol.ServerEnvelope) error {
+	return client.WriteEvent(envelope)
+}
+
+func (a *App) restoreSnapshot(tableID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.SnapshotTimeout)
+	defer cancel()
+
+	loadedSnapshot, seq, found, err := a.snapshotStore.Load(ctx, tableID)
+	if err != nil {
+		a.logger.Printf("failed to load table snapshot: table=%s err=%v", tableID, err)
+		return
+	}
+	if !found {
+		return
+	}
+
+	restoreTableID := tableID
+	if strings.TrimSpace(loadedSnapshot.TableID) != "" {
+		restoreTableID = loadedSnapshot.TableID
+	}
+
+	if err := a.tables.Restore(restoreTableID, loadedSnapshot, seq); err != nil {
+		a.logger.Printf("failed to restore table snapshot: table=%s err=%v", restoreTableID, err)
+		return
+	}
+
+	a.logger.Printf("restored table snapshot: table=%s players=%d seq=%d", restoreTableID, loadedSnapshot.ActivePlayers, seq)
+}
+
+func (a *App) persistSnapshot(snapshot table.Snapshot, seq uint64) {
+	if !a.cfg.SnapshotEnabled {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.SnapshotTimeout)
+	defer cancel()
+
+	if err := a.snapshotStore.Save(ctx, snapshot, seq); err != nil {
+		a.logger.Printf("failed to persist table snapshot: table=%s seq=%d err=%v", snapshot.TableID, seq, err)
+	}
 }
 
 func (a *App) authFromCookie(r *http.Request) (session.PlayerSession, bool) {

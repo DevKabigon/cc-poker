@@ -5,6 +5,7 @@ import "encoding/json"
 // ClientEnvelope은 클라이언트가 WS로 보내는 이벤트 기본 형식이다.
 type ClientEnvelope struct {
 	EventType string          `json:"event_type"`
+	RequestID string          `json:"request_id,omitempty"`
 	Payload   json.RawMessage `json:"payload"`
 }
 

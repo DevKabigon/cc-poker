@@ -23,6 +23,8 @@ var (
 	ErrSeatTaken = errors.New("seat is already taken")
 	// ErrPlayerNotFound는 플레이어가 테이블에 없을 때 반환된다.
 	ErrPlayerNotFound = errors.New("player is not seated")
+	// ErrSnapshotInvalid는 외부에서 로드한 스냅샷 데이터가 유효하지 않을 때 반환된다.
+	ErrSnapshotInvalid = errors.New("snapshot is invalid")
 )
 
 // Player는 테이블 좌석에 앉은 플레이어 정보를 나타낸다.
@@ -109,6 +111,40 @@ func (t *Table) Snapshot() (Snapshot, uint64) {
 	defer t.mu.Unlock()
 
 	return t.snapshotLocked(), t.seq
+}
+
+// Restore는 저장된 스냅샷을 기반으로 테이블 상태를 복구한다.
+func (t *Table) Restore(snapshot Snapshot, seq uint64) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if snapshot.TableID != "" && snapshot.TableID != t.id {
+		return ErrSnapshotInvalid
+	}
+
+	var seats [MaxPlayers]*Player
+	playerSeat := make(map[string]int, len(snapshot.Players))
+
+	for _, player := range snapshot.Players {
+		if player.PlayerID == "" || player.SeatIndex < 0 || player.SeatIndex >= MaxPlayers {
+			return ErrSnapshotInvalid
+		}
+		if _, exists := playerSeat[player.PlayerID]; exists {
+			return ErrSnapshotInvalid
+		}
+		if seats[player.SeatIndex] != nil {
+			return ErrSnapshotInvalid
+		}
+
+		copied := player
+		seats[player.SeatIndex] = &copied
+		playerSeat[player.PlayerID] = player.SeatIndex
+	}
+
+	t.seats = seats
+	t.playerSeat = playerSeat
+	t.seq = seq
+	return nil
 }
 
 func (t *Table) allocateSeatLocked(preferredSeat *int) (int, error) {

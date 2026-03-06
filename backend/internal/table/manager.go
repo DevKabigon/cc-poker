@@ -35,6 +35,12 @@ func (m *Manager) Snapshot(tableID string) (Snapshot, uint64) {
 	return table.Snapshot()
 }
 
+// Restore는 저장된 스냅샷으로 테이블 상태를 복구한다.
+func (m *Manager) Restore(tableID string, snapshot Snapshot, seq uint64) error {
+	table := m.getOrCreateTable(tableID)
+	return table.Restore(snapshot, seq)
+}
+
 func (m *Manager) getOrCreateTable(tableID string) *Table {
 	m.mu.Lock()
 	defer m.mu.Unlock()
