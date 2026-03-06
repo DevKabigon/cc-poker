@@ -1,53 +1,56 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
+
+	"github.com/DevKabigon/cc-poker/backend/internal/app"
+	"github.com/DevKabigon/cc-poker/backend/internal/config"
 )
 
-type healthResponse struct {
-	Status    string `json:"status"`
-	Service   string `json:"service"`
-	Timestamp string `json:"timestamp"`
-}
-
 func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", healthHandler)
+	cfg := config.Load()
+	logger := log.New(os.Stdout, "", log.LstdFlags|log.LUTC)
+	application := app.New(cfg, logger)
 
-	addr := getenv("CC_POKER_BACKEND_ADDR", ":8080")
-
-	// 서버 시작 시 운영 로그에서 빠르게 식별할 수 있도록 기본 정보를 출력한다.
-	log.Printf("cc-poker backend server listening on %s", addr)
-
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatalf("failed to start http server: %v", err)
-	}
-}
-
-// healthHandler는 서버 상태를 확인하기 위한 헬스체크 응답을 반환한다.
-func healthHandler(w http.ResponseWriter, _ *http.Request) {
-	resp := healthResponse{
-		Status:    "ok",
-		Service:   "cc-poker-backend",
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	server := &http.Server{
+		Addr:              cfg.HTTPAddr,
+		Handler:           application.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		http.Error(w, "failed to encode health response", http.StatusInternalServerError)
-		return
-	}
-}
+	errorCh := make(chan error, 1)
+	go func() {
+		logger.Printf("cc-poker backend server listening on %s", cfg.HTTPAddr)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errorCh <- err
+		}
+	}()
 
-// getenv는 환경변수가 비어 있을 때 기본값을 반환한다.
-func getenv(key, fallback string) string {
-	value := os.Getenv(key)
-	if value == "" {
-		return fallback
+	signalCh := make(chan os.Signal, 1)
+	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case received := <-signalCh:
+		logger.Printf("shutdown signal received: %s", received.String())
+	case err := <-errorCh:
+		logger.Fatalf("server error: %v", err)
 	}
-	return value
+
+	// 종료 시 연결을 정리할 시간을 주어 요청 중단을 최소화한다.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		logger.Printf("graceful shutdown failed: %v", err)
+		if closeErr := server.Close(); closeErr != nil {
+			logger.Printf("forced close failed: %v", closeErr)
+		}
+	}
 }

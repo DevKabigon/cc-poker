@@ -11,3 +11,8 @@ backend/bin/
 # IDE / OS
 .DS_Store
 Thumbs.db
+
+# Frontend
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo
