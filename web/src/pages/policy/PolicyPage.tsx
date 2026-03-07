@@ -7,13 +7,13 @@ export function PolicyPage() {
     <main className="page">
       <TopNav />
 
-      <section className="hero">
+      <section className="hero reveal reveal-2">
         <p className="eyebrow">CC Poker Wallet Rules</p>
         <h1>Wallet Policy</h1>
         <p className="subtitle">초기 칩 지급 정책과 서버 권위형 지갑 관리 원칙입니다.</p>
       </section>
 
-      <Card className="panel controls" style={{ marginTop: 16 }}>
+      <Card className="panel controls reveal reveal-3">
         <CardHeader>
           <CardTitle>기본 정책</CardTitle>
           <CardDescription>모든 잔액은 서버 DB 기준으로만 인정됩니다.</CardDescription>

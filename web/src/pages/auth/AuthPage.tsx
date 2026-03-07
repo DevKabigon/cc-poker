@@ -30,7 +30,7 @@ export function AuthPage() {
     <main className="page">
       <TopNav />
 
-      <section className="hero">
+      <section className="hero reveal reveal-2">
         <p className="eyebrow">CC Poker Authentication</p>
         <h1>Guest / Login Session</h1>
         <p className="subtitle">
@@ -39,7 +39,7 @@ export function AuthPage() {
       </section>
 
       <section className="layout">
-        <Card className="panel">
+        <Card className="panel reveal reveal-3">
           <CardHeader>
             <CardTitle>세션 생성</CardTitle>
             <CardDescription>게스트 또는 Supabase 계정으로 접속합니다.</CardDescription>
@@ -51,6 +51,7 @@ export function AuthPage() {
                 id="nickname"
                 value={nickname}
                 onChange={(event) => setNickname(event.target.value)}
+                placeholder="닉네임을 입력하세요"
                 maxLength={20}
               />
             </div>
@@ -78,7 +79,9 @@ export function AuthPage() {
             </div>
 
             <div className="button-row" style={{ marginTop: 0 }}>
-              <Button onClick={createGuestSession}>게스트 시작</Button>
+              <Button onClick={createGuestSession} disabled={!nickname.trim()}>
+                게스트 시작
+              </Button>
               <Button variant="outline" onClick={signUpWithSupabase}>
                 회원가입
               </Button>
@@ -106,7 +109,7 @@ export function AuthPage() {
           </CardContent>
         </Card>
 
-        <Card className="panel">
+        <Card className="panel reveal reveal-4">
           <CardHeader>
             <CardTitle>현재 상태</CardTitle>
             <CardDescription>세션 생성 이후 Play Console에서 소켓/테이블을 진행하세요.</CardDescription>

@@ -1,28 +1,35 @@
 import { NavLink, useLocation } from "react-router-dom";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ThemeToggle } from "@/features/theme/ui/ThemeToggle";
+
+const NAV_ITEMS = [
+  { to: "/auth", label: "Auth" },
+  { to: "/play", label: "Play Console" },
+  { to: "/policy", label: "Wallet Policy" }
+] as const;
 
 export function TopNav() {
   const location = useLocation();
 
   return (
-    <nav className="panel controls" style={{ marginBottom: 12, display: "flex", gap: 12 }}>
-      <Badge variant="secondary">CC Poker</Badge>
-      <div className="button-row" style={{ marginTop: 0 }}>
-        <Button asChild variant={location.pathname === "/auth" ? "default" : "outline"} size="sm">
-          <NavLink to="/auth">Auth</NavLink>
-        </Button>
-        <Button asChild variant={location.pathname === "/play" ? "default" : "outline"} size="sm">
-          <NavLink to="/play">Play Console</NavLink>
-        </Button>
-        <Button
-          asChild
-          variant={location.pathname === "/policy" ? "default" : "outline"}
-          size="sm"
-        >
-          <NavLink to="/policy">Wallet Policy</NavLink>
-        </Button>
+    <nav className="panel controls top-nav reveal reveal-1">
+      <div className="top-nav__left">
+        <Badge variant="secondary">CC Poker Lounge</Badge>
+        <div className="button-row">
+          {NAV_ITEMS.map((item) => (
+            <Button
+              key={item.to}
+              asChild
+              variant={location.pathname === item.to ? "default" : "outline"}
+              size="sm"
+            >
+              <NavLink to={item.to}>{item.label}</NavLink>
+            </Button>
+          ))}
+        </div>
       </div>
+      <ThemeToggle />
     </nav>
   );
 }

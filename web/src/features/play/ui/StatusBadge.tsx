@@ -12,7 +12,9 @@ export function StatusBadge({ label, value }: StatusBadgeProps) {
       <CardContent className="p-3">
         <span>{label}</span>
         <div>
-          <Badge variant="outline">{value}</Badge>
+          <Badge variant="outline" className="max-w-full break-all">
+            {value}
+          </Badge>
         </div>
       </CardContent>
     </Card>

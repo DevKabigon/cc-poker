@@ -247,6 +247,11 @@ func (a *App) handleGuestSession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// 게스트 입장은 닉네임을 반드시 입력하도록 강제한다.
+	if strings.TrimSpace(req.Nickname) == "" {
+		http.Error(w, "nickname is required", http.StatusBadRequest)
+		return
+	}
 
 	created, err := a.sessions.CreateGuest(req.Nickname, a.cfg.SessionTTL)
 	if err != nil {

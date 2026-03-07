@@ -18,7 +18,7 @@ const SUPABASE_ANON_KEY = String(import.meta.env.VITE_SUPABASE_ANON_KEY ?? "").t
 const fetcher = (url: string) => fetch(url, { credentials: "include" }).then((res) => res.json());
 
 export function usePlayConsole() {
-  const [nickname, setNickname] = useState("Kabigon");
+  const [nickname, setNickname] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [status, setStatus] = useState<ConnectionStatus>("idle");
@@ -37,8 +37,9 @@ export function usePlayConsole() {
   const clearLastError = useAppStore((state) => state.clearLastError);
 
   const { data: health } = useSWR<HealthResponse>("/health", fetcher, {
-    refreshInterval: 15000,
-    dedupingInterval: 5000
+    revalidateOnFocus: false,
+    revalidateOnReconnect: false,
+    shouldRetryOnError: false
   });
 
   const appendEvent = useCallback((next: string) => {
@@ -85,6 +86,9 @@ export function usePlayConsole() {
   const createGuestSession = useCallback(async () => {
     clearLastError();
     try {
+      if (!nickname.trim()) {
+        throw new Error("nickname is required");
+      }
       const response = await fetch("/v1/session/guest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },

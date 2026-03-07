@@ -33,7 +33,7 @@ export function PlayPage() {
     <main className="page">
       <TopNav />
 
-      <section className="hero">
+      <section className="hero reveal reveal-2">
         <p className="eyebrow">CC Poker Play Console</p>
         <h1>Socket + Buy-In + Join / Leave</h1>
         <p className="subtitle">
@@ -42,7 +42,7 @@ export function PlayPage() {
       </section>
 
       {!session && (
-        <Alert>
+        <Alert className="reveal reveal-3">
           <AlertTitle>세션이 필요합니다</AlertTitle>
           <AlertDescription>
             이 페이지를 사용하려면 먼저 인증이 필요합니다. <Link to="/auth">/auth</Link> 에서 게스트
@@ -51,7 +51,7 @@ export function PlayPage() {
         </Alert>
       )}
 
-      <Card className="panel controls" style={{ marginTop: 16 }}>
+      <Card className="panel controls reveal reveal-3">
         <CardHeader>
           <CardTitle>테이블 제어</CardTitle>
           <CardDescription>현재 선택 테이블 기준으로 바이인 및 실시간 액션을 요청합니다.</CardDescription>
@@ -124,7 +124,7 @@ export function PlayPage() {
       </Card>
 
       <section className="layout">
-        <Card className="panel table-panel">
+        <Card className="panel table-panel reveal reveal-4">
           <CardHeader>
             <CardTitle>Table Seat Map</CardTitle>
             <CardDescription>현재 테이블 스냅샷 좌석 정보</CardDescription>
@@ -149,7 +149,7 @@ export function PlayPage() {
           </CardContent>
         </Card>
 
-        <Card className="panel event-panel">
+        <Card className="panel event-panel reveal reveal-4">
           <CardHeader>
             <CardTitle>Recent Events</CardTitle>
             <CardDescription>최근 12개 이벤트 로그</CardDescription>
