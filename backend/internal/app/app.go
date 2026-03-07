@@ -72,6 +72,13 @@ type tableBuyInResponse struct {
 	CreatedAt    string `json:"created_at"`
 }
 
+type walletResponse struct {
+	PlayerID  string `json:"player_id"`
+	UserType  string `json:"user_type"`
+	Balance   int64  `json:"balance"`
+	Timestamp string `json:"timestamp"`
+}
+
 type healthResponse struct {
 	Status    string `json:"status"`
 	Service   string `json:"service"`
@@ -230,6 +237,7 @@ func (a *App) registerRoutes() {
 	a.mux.HandleFunc("/v1/auth/nickname/check", a.handleNicknameCheck)
 	a.mux.HandleFunc("/v1/auth/exchange", a.handleAuthExchange)
 	a.mux.HandleFunc("/v1/auth/logout", a.handleAuthLogout)
+	a.mux.HandleFunc("/v1/wallet", a.handleWallet)
 	a.mux.HandleFunc("/v1/tables/buy-in", a.handleTableBuyIn)
 	a.mux.HandleFunc("/ws", a.handleWebSocket)
 }
@@ -420,6 +428,48 @@ func (a *App) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 		Expires:  time.Unix(0, 0),
 	})
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleWallet은 인증된 플레이어의 현재 지갑 잔액을 반환한다.
+func (a *App) handleWallet(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	playerSession, ok := a.authFromCookie(r)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	initialBalance := a.cfg.GuestWalletInitial
+	if strings.EqualFold(playerSession.UserType, "auth") {
+		initialBalance = a.cfg.AuthWalletInitial
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.PostgresTimeout)
+	defer cancel()
+
+	if err := a.eventStore.EnsureWallet(ctx, playerSession.PlayerID, initialBalance); err != nil {
+		a.logger.Printf("failed to ensure wallet before query: player=%s err=%v", playerSession.PlayerID, err)
+		http.Error(w, "failed to ensure wallet", http.StatusInternalServerError)
+		return
+	}
+
+	balance, err := a.eventStore.GetWalletBalance(ctx, playerSession.PlayerID)
+	if err != nil {
+		a.logger.Printf("failed to query wallet balance: player=%s err=%v", playerSession.PlayerID, err)
+		http.Error(w, "failed to query wallet", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, walletResponse{
+		PlayerID:  playerSession.PlayerID,
+		UserType:  playerSession.UserType,
+		Balance:   balance,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	})
 }
 
 // handleTableBuyIn은 쿠키 인증된 플레이어의 테이블 바이인을 생성한다.

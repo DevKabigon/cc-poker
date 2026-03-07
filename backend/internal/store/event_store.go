@@ -50,6 +50,7 @@ var (
 type EventStore interface {
 	SeedRoomsAndTables(ctx context.Context) error
 	EnsureWallet(ctx context.Context, playerID string, initialBalance int64) error
+	GetWalletBalance(ctx context.Context, playerID string) (int64, error)
 	CreateBuyIn(ctx context.Context, playerID, tableID string, amount int64) (BuyInReceipt, error)
 	ConsumePendingBuyIn(ctx context.Context, playerID, tableID string) (BuyInReceipt, error)
 	IsNicknameTaken(ctx context.Context, nickname string) (bool, error)
@@ -84,6 +85,13 @@ func (n *noopEventStore) EnsureWallet(_ context.Context, playerID string, initia
 		n.balances[playerID] = initialBalance
 	}
 	return nil
+}
+
+func (n *noopEventStore) GetWalletBalance(_ context.Context, playerID string) (int64, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	return n.balances[playerID], nil
 }
 
 func (n *noopEventStore) CreateBuyIn(_ context.Context, playerID, tableID string, amount int64) (BuyInReceipt, error) {

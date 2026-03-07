@@ -17,6 +17,8 @@ export function PlayPage() {
     setBuyInAmount,
     status,
     health,
+    wallet,
+    walletLoading,
     session,
     notice,
     lastError,
@@ -28,6 +30,12 @@ export function PlayPage() {
     joinTable,
     leaveTable
   } = usePlayConsole();
+
+  const walletValue = !session
+    ? "-"
+    : walletLoading
+      ? "loading..."
+      : formatChips(wallet?.balance ?? 0);
 
   return (
     <main className="page">
@@ -101,6 +109,7 @@ export function PlayPage() {
             <StatusBadge label="Nickname" value={session ? session.nickname : "-"} />
             <StatusBadge label="WS" value={status} />
             <StatusBadge label="Backend" value={health?.status ?? "unknown"} />
+            <StatusBadge label="Wallet" value={walletValue} />
             <StatusBadge
               label="Players"
               value={`${seatGrid.filter((slot) => slot.player !== null).length}/9`}
@@ -165,4 +174,8 @@ export function PlayPage() {
       </section>
     </main>
   );
+}
+
+function formatChips(value: number) {
+  return `$${value.toLocaleString("en-US")}`;
 }

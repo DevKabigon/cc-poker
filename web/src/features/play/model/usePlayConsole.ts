@@ -1,7 +1,8 @@
 import { useCallback, useMemo, useRef, useState } from "react";
-import useSWR from "swr";
+import useSWR, { useSWRConfig } from "swr";
 import { useAppStore, type SessionSnapshot } from "../../../store/useAppStore";
 import type {
+  BuyInResponse,
   ConnectionStatus,
   HealthResponse,
   NicknameCheckResponse,
@@ -10,14 +11,13 @@ import type {
   SupabaseLoginResponse,
   SupabaseSignupResponse,
   TableSnapshot,
-  UiNotice
+  UiNotice,
+  WalletResponse
 } from "./types";
 
 const DEFAULT_TABLE = "room_1_2_table_1";
 const SUPABASE_URL = String(import.meta.env.VITE_SUPABASE_URL ?? "").trim();
 const SUPABASE_ANON_KEY = String(import.meta.env.VITE_SUPABASE_ANON_KEY ?? "").trim();
-
-const fetcher = (url: string) => fetch(url, { credentials: "include" }).then((res) => res.json());
 
 export function usePlayConsole() {
   const [nickname, setNickname] = useState("");
@@ -37,12 +37,24 @@ export function usePlayConsole() {
   const lastError = useAppStore((state) => state.lastError);
   const setLastError = useAppStore((state) => state.setLastError);
   const clearLastError = useAppStore((state) => state.clearLastError);
+  const { mutate } = useSWRConfig();
 
-  const { data: health } = useSWR<HealthResponse>("/health", fetcher, {
+  const { data: health } = useSWR<HealthResponse>("/health", fetchJSON, {
     revalidateOnFocus: false,
     revalidateOnReconnect: false,
     shouldRetryOnError: false
   });
+
+  const walletKey = session ? "/v1/wallet" : null;
+  const { data: wallet, isLoading: walletLoading } = useSWR<WalletResponse>(
+    walletKey,
+    fetchJSON,
+    {
+      revalidateOnFocus: true,
+      revalidateOnReconnect: true,
+      shouldRetryOnError: false
+    }
+  );
 
   const appendEvent = useCallback((next: string) => {
     setEvents((prev) => [next, ...prev].slice(0, 12));
@@ -52,8 +64,9 @@ export function usePlayConsole() {
     (nextSession: SessionSnapshot) => {
       setSession(nextSession);
       appendEvent(`SESSION ${nextSession.player_id} (${nextSession.nickname})`);
+      void mutate("/v1/wallet");
     },
-    [appendEvent, setSession]
+    [appendEvent, mutate, setSession]
   );
 
   const requireSupabaseConfig = useCallback(() => {
@@ -256,6 +269,7 @@ export function usePlayConsole() {
     closeSocket();
     setStatus("idle");
     setSnapshot(null);
+    setNotice(null);
     try {
       await fetch("/v1/auth/logout", {
         method: "POST",
@@ -263,9 +277,10 @@ export function usePlayConsole() {
       });
     } finally {
       clearSession();
+      void mutate("/v1/wallet", undefined, { revalidate: false });
       appendEvent("LOGOUT");
     }
-  }, [appendEvent, clearLastError, clearSession, closeSocket]);
+  }, [appendEvent, clearLastError, clearSession, closeSocket, mutate]);
 
   const connectSocket = useCallback(() => {
     clearLastError();
@@ -358,17 +373,34 @@ export function usePlayConsole() {
         body: JSON.stringify({ table_id: selectedTable, amount: Math.floor(parsedAmount) })
       });
       if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`buy-in failed: ${response.status} ${errorText}`);
+        const errorText = (await response.text()).trim().toLowerCase();
+        if (response.status === 409 && errorText.includes("insufficient wallet balance")) {
+          throw new Error("잔액이 부족합니다.");
+        }
+        if (response.status === 400 && errorText.includes("buy-in amount")) {
+          throw new Error("해당 룸의 바이인 허용 금액 범위를 확인해주세요.");
+        }
+        if (response.status === 404 && errorText.includes("table not found")) {
+          throw new Error("존재하지 않는 테이블입니다.");
+        }
+        throw new Error(`바이인 요청에 실패했습니다. (${response.status})`);
       }
 
+      const buyInResult = (await response.json()) as BuyInResponse;
+      const optimisticWallet: WalletResponse = {
+        player_id: buyInResult.player_id,
+        user_type: session?.user_type ?? "guest",
+        balance: buyInResult.balance_after,
+        timestamp: new Date().toISOString()
+      };
+      void mutate("/v1/wallet", optimisticWallet, { revalidate: true });
       appendEvent(`BUY_IN ${selectedTable} ${Math.floor(parsedAmount)}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : "unknown buy-in error";
       setLastError(message);
       appendEvent(`BUY_IN_ERROR ${message}`);
     }
-  }, [appendEvent, buyInAmount, clearLastError, selectedTable, setLastError]);
+  }, [appendEvent, buyInAmount, clearLastError, mutate, selectedTable, session, setLastError]);
 
   const seatGrid = useMemo(() => {
     const occupied = new Map<number, SnapshotPlayer>();
@@ -393,6 +425,8 @@ export function usePlayConsole() {
     setBuyInAmount,
     status,
     health,
+    wallet,
+    walletLoading,
     session,
     notice,
     lastError,
@@ -407,6 +441,15 @@ export function usePlayConsole() {
     joinTable,
     leaveTable
   };
+}
+
+async function fetchJSON<T>(url: string): Promise<T> {
+  const response = await fetch(url, { credentials: "include" });
+  if (!response.ok) {
+    const errorText = (await response.text()).trim();
+    throw new Error(errorText || `request failed: ${response.status}`);
+  }
+  return (await response.json()) as T;
 }
 
 function createRequestId() {

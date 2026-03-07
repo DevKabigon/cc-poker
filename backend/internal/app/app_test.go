@@ -345,6 +345,24 @@ func TestGuestWalletInitialIs2000(t *testing.T) {
 	createBuyInExpectStatus(t, server.URL, cookie, "table-1", 2500, http.StatusConflict)
 }
 
+func TestWalletEndpointReturnsCurrentBalance(t *testing.T) {
+	app := newTestApp()
+	server := httptest.NewServer(app.Handler())
+	defer server.Close()
+
+	cookie := issueGuestCookie(t, server.URL)
+	initialBalance := readWalletBalance(t, server.URL, cookie)
+	if initialBalance != 2000 {
+		t.Fatalf("unexpected initial wallet balance: got=%d want=%d", initialBalance, 2000)
+	}
+
+	createBuyIn(t, server.URL, cookie, "table-1", 400)
+	updatedBalance := readWalletBalance(t, server.URL, cookie)
+	if updatedBalance != 1600 {
+		t.Fatalf("unexpected wallet balance after buy-in: got=%d want=%d", updatedBalance, 1600)
+	}
+}
+
 func TestWebSocketRejectsWithoutCookie(t *testing.T) {
 	app := newTestApp()
 	server := httptest.NewServer(app.Handler())
@@ -639,6 +657,34 @@ func createBuyInExpectStatus(t *testing.T, baseURL string, cookie *http.Cookie, 
 	if res.StatusCode != expectedStatus {
 		t.Fatalf("unexpected buy-in status code: got=%d want=%d", res.StatusCode, expectedStatus)
 	}
+}
+
+func readWalletBalance(t *testing.T, baseURL string, cookie *http.Cookie) int64 {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodGet, baseURL+"/v1/wallet", nil)
+	if err != nil {
+		t.Fatalf("failed to create wallet request: %v", err)
+	}
+	req.AddCookie(cookie)
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("failed to call wallet endpoint: %v", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected wallet status code: got=%d want=%d", res.StatusCode, http.StatusOK)
+	}
+
+	var payload struct {
+		Balance int64 `json:"balance"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
+		t.Fatalf("failed to decode wallet response: %v", err)
+	}
+	return payload.Balance
 }
 
 type fakeSnapshotStore struct {

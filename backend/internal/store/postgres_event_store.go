@@ -164,6 +164,22 @@ func (s *postgresEventStore) EnsureWallet(ctx context.Context, playerID string, 
 	return nil
 }
 
+// GetWalletBalance는 플레이어 지갑의 현재 잔액을 조회한다.
+func (s *postgresEventStore) GetWalletBalance(ctx context.Context, playerID string) (int64, error) {
+	var balance int64
+	if err := s.pool.QueryRow(ctx, `
+		SELECT balance
+		FROM wallets
+		WHERE player_id = $1
+	`, playerID).Scan(&balance); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("failed to query wallet balance: %w", err)
+	}
+	return balance, nil
+}
+
 // CreateBuyIn은 바이인 금액 검증/지갑 차감/바이인 생성을 원자적으로 처리한다.
 func (s *postgresEventStore) CreateBuyIn(ctx context.Context, playerID, tableID string, amount int64) (BuyInReceipt, error) {
 	tx, err := s.pool.Begin(ctx)

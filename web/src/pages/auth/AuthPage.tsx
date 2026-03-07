@@ -17,6 +17,8 @@ export function AuthPage() {
     password,
     setPassword,
     session,
+    wallet,
+    walletLoading,
     notice,
     lastError,
     health,
@@ -25,6 +27,12 @@ export function AuthPage() {
     signInWithSupabase,
     logout
   } = usePlayConsole();
+
+  const walletValue = !session
+    ? "-"
+    : walletLoading
+      ? "loading..."
+      : formatChips(wallet?.balance ?? 0);
 
   return (
     <main className="page">
@@ -128,6 +136,9 @@ export function AuthPage() {
               Nickname: <Badge variant="outline">{session?.nickname ?? "-"}</Badge>
             </p>
             <p>
+              Wallet: <Badge variant="outline">{walletValue}</Badge>
+            </p>
+            <p>
               Email Verified:{" "}
               <Badge variant={session?.email_verified ? "default" : "secondary"}>
                 {session?.email_verified ? "yes" : "no"}
@@ -141,4 +152,8 @@ export function AuthPage() {
       </section>
     </main>
   );
+}
+
+function formatChips(value: number) {
+  return `$${value.toLocaleString("en-US")}`;
 }

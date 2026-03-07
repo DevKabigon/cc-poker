@@ -3,6 +3,7 @@ import { create } from "zustand";
 export type SessionSnapshot = {
   player_id: string;
   nickname: string;
+  user_type?: string;
   expires_at: string;
   email?: string;
   email_verified?: boolean;
@@ -25,4 +26,3 @@ export const useAppStore = create<AppStore>((set) => ({
   setLastError: (error) => set({ lastError: error }),
   clearLastError: () => set({ lastError: "" })
 }));
-

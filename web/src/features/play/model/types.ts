@@ -39,6 +39,24 @@ export type NicknameCheckResponse = {
   available: boolean;
 };
 
+export type WalletResponse = {
+  player_id: string;
+  user_type: string;
+  balance: number;
+  timestamp: string;
+};
+
+export type BuyInResponse = {
+  buy_in_id: number;
+  player_id: string;
+  table_id: string;
+  room_id: string;
+  amount: number;
+  balance_after: number;
+  status: string;
+  created_at: string;
+};
+
 export type HealthResponse = {
   status: string;
   service: string;
