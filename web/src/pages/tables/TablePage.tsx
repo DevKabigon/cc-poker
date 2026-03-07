@@ -1,15 +1,21 @@
-import { Link } from "react-router-dom";
+import { useEffect } from "react";
+import { Link, Navigate, useParams } from "react-router-dom";
 import { TopNav } from "../../features/navigation/ui/TopNav";
 import { StatusBadge } from "../../features/play/ui/StatusBadge";
 import { usePlayConsole } from "../../features/play/model/usePlayConsole";
+import { findRoomById, parseRoomIDFromTableID } from "../../features/rooms/model/roomCatalog";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
 
-export function PlayPage() {
+export function TablePage() {
+  const { tableId = "" } = useParams();
+  const roomID = parseRoomIDFromTableID(tableId);
+  const room = roomID ? findRoomById(roomID) : null;
+
   const {
     selectedTable,
     setSelectedTable,
@@ -32,52 +38,66 @@ export function PlayPage() {
     leaveTable
   } = usePlayConsole();
 
-  const walletValue = !session
-    ? "-"
-    : walletLoading
-      ? "loading..."
-      : walletError
-        ? "unavailable"
-        : wallet
-          ? formatChips(wallet.balance)
-          : "-";
+  useEffect(() => {
+    if (!tableId) {
+      return;
+    }
+    setSelectedTable(tableId);
+  }, [setSelectedTable, tableId]);
+
+  if (!session) {
+    return <Navigate to="/auth" replace />;
+  }
+
+  if (!room || tableId === "") {
+    return (
+      <main className="page">
+        <TopNav />
+        <Alert className="reveal reveal-3">
+          <AlertTitle>유효하지 않은 테이블 ID입니다</AlertTitle>
+          <AlertDescription>
+            테이블 목록에서 다시 선택해주세요. <Link to="/lobby">로비로 이동</Link>
+          </AlertDescription>
+        </Alert>
+      </main>
+    );
+  }
+
+  const walletValue = walletLoading
+    ? "loading..."
+    : walletError
+      ? "unavailable"
+      : wallet
+        ? formatChips(wallet.balance)
+        : "-";
 
   return (
     <main className="page">
       <TopNav />
 
       <section className="hero reveal reveal-2">
-        <p className="eyebrow">CC Poker Play Console</p>
-        <h1>Socket + Buy-In + Join / Leave</h1>
+        <p className="eyebrow">CC Poker Table</p>
+        <h1>{`${room.label} - ${tableId}`}</h1>
         <p className="subtitle">
-          인증 이후 소켓 연결, 바이인, 테이블 입장/퇴장을 단계별로 검증합니다.
+          바이인 후 소켓 접속 -&gt; 입장 -&gt; 퇴장을 검증합니다. 룸 이동은 상단 내비게이션으로 가능합니다.
         </p>
       </section>
-
-      {!session && (
-        <Alert className="reveal reveal-3">
-          <AlertTitle>세션이 필요합니다</AlertTitle>
-          <AlertDescription>
-            이 페이지를 사용하려면 먼저 인증이 필요합니다. <Link to="/auth">/auth</Link> 에서 게스트
-            또는 로그인 세션을 생성하세요.
-          </AlertDescription>
-        </Alert>
-      )}
 
       <Card className="panel controls reveal reveal-3">
         <CardHeader>
           <CardTitle>테이블 제어</CardTitle>
-          <CardDescription>현재 선택 테이블 기준으로 바이인 및 실시간 액션을 요청합니다.</CardDescription>
+          <CardDescription>
+            {`Room ${room.id} / Table ${tableId} 기준으로 바이인과 실시간 이벤트를 수행합니다.`}
+          </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="field" style={{ maxWidth: "100%" }}>
-            <Label htmlFor="table-id">Table ID</Label>
-            <Input
-              id="table-id"
-              value={selectedTable}
-              onChange={(event) => setSelectedTable(event.target.value)}
-              maxLength={40}
-            />
+          <div className="status-grid">
+            <StatusBadge label="Room" value={room.label} />
+            <StatusBadge label="Table" value={selectedTable} />
+            <StatusBadge label="Session" value={session.player_id} />
+            <StatusBadge label="WS" value={status} />
+            <StatusBadge label="Backend" value={health?.status ?? "unknown"} />
+            <StatusBadge label="Wallet" value={walletValue} />
           </div>
 
           <div className="field" style={{ maxWidth: "100%" }}>
@@ -89,13 +109,19 @@ export function PlayPage() {
               value={buyInAmount}
               onChange={(event) => setBuyInAmount(event.target.value)}
             />
+            <p>
+              Allowed Range:{" "}
+              <Badge variant="outline">
+                {formatChips(room.minBuyIn)} - {formatChips(room.maxBuyIn)}
+              </Badge>
+            </p>
           </div>
 
           <div className="button-row" style={{ marginTop: 0 }}>
-            <Button variant="outline" onClick={connectSocket} disabled={!session}>
+            <Button variant="outline" onClick={connectSocket}>
               Connect WS
             </Button>
-            <Button variant="outline" onClick={requestBuyIn} disabled={!session}>
+            <Button variant="outline" onClick={requestBuyIn}>
               Buy-In
             </Button>
             <Button variant="outline" onClick={joinTable} disabled={status !== "connected"}>
@@ -104,21 +130,12 @@ export function PlayPage() {
             <Button variant="outline" onClick={leaveTable} disabled={status !== "connected"}>
               Leave Table
             </Button>
-            <Button variant="outline" onClick={logout} disabled={!session}>
+            <Button variant="outline" onClick={logout}>
               Logout
             </Button>
-          </div>
-
-          <div className="status-grid">
-            <StatusBadge label="Session" value={session ? session.player_id : "none"} />
-            <StatusBadge label="Nickname" value={session ? session.nickname : "-"} />
-            <StatusBadge label="WS" value={status} />
-            <StatusBadge label="Backend" value={health?.status ?? "unknown"} />
-            <StatusBadge label="Wallet" value={walletValue} />
-            <StatusBadge
-              label="Players"
-              value={`${seatGrid.filter((slot) => slot.player !== null).length}/9`}
-            />
+            <Button asChild variant="outline">
+              <Link to={`/rooms/${room.id}`}>룸 목록</Link>
+            </Button>
           </div>
 
           {notice && (
@@ -132,15 +149,6 @@ export function PlayPage() {
             <Alert variant="destructive">
               <AlertTitle>오류</AlertTitle>
               <AlertDescription>{lastError}</AlertDescription>
-            </Alert>
-          )}
-
-          {session && walletError && (
-            <Alert variant="destructive">
-              <AlertTitle>지갑 조회 실패</AlertTitle>
-              <AlertDescription>
-                /v1/wallet 호출이 실패했습니다. 백엔드 상태와 프록시를 확인해주세요.
-              </AlertDescription>
             </Alert>
           )}
         </CardContent>

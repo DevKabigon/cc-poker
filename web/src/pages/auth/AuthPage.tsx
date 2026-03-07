@@ -18,6 +18,7 @@ export function AuthPage() {
     setPassword,
     session,
     wallet,
+    walletError,
     walletLoading,
     notice,
     lastError,
@@ -32,7 +33,11 @@ export function AuthPage() {
     ? "-"
     : walletLoading
       ? "loading..."
-      : formatChips(wallet?.balance ?? 0);
+      : walletError
+        ? "unavailable"
+        : wallet
+          ? formatChips(wallet.balance)
+          : "-";
 
   return (
     <main className="page">
@@ -114,13 +119,22 @@ export function AuthPage() {
                 <AlertDescription>{lastError}</AlertDescription>
               </Alert>
             )}
+
+            {session && walletError && (
+              <Alert variant="destructive">
+                <AlertTitle>지갑 조회 실패</AlertTitle>
+                <AlertDescription>
+                  /v1/wallet 응답을 확인해주세요. 현재 UI는 0 대신 unavailable로 표시됩니다.
+                </AlertDescription>
+              </Alert>
+            )}
           </CardContent>
         </Card>
 
         <Card className="panel reveal reveal-4">
           <CardHeader>
             <CardTitle>현재 상태</CardTitle>
-            <CardDescription>세션 생성 이후 Play Console에서 소켓/테이블을 진행하세요.</CardDescription>
+            <CardDescription>세션 생성 이후 로비에서 룸과 테이블을 선택해 플레이를 진행하세요.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
             <p>
@@ -145,7 +159,7 @@ export function AuthPage() {
               </Badge>
             </p>
             <Button asChild>
-              <Link to="/play">Play Console로 이동</Link>
+              <Link to="/lobby">로비로 이동</Link>
             </Button>
           </CardContent>
         </Card>

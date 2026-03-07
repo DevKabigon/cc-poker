@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import useSWR, { useSWRConfig } from "swr";
 import { useAppStore, type SessionSnapshot } from "../../../store/useAppStore";
 import type {
@@ -30,6 +30,7 @@ export function usePlayConsole() {
   const [selectedTable, setSelectedTable] = useState(DEFAULT_TABLE);
   const [buyInAmount, setBuyInAmount] = useState("200");
   const wsRef = useRef<WebSocket | null>(null);
+  const selfSeatedRef = useRef(false);
 
   const session = useAppStore((state) => state.session);
   const setSession = useAppStore((state) => state.setSession);
@@ -45,8 +46,33 @@ export function usePlayConsole() {
     shouldRetryOnError: false
   });
 
+  const { data: restoredSession } = useSWR<SessionSnapshot | null>(
+    "/v1/session/current",
+    fetchCurrentSession,
+    {
+      revalidateOnFocus: false,
+      revalidateOnReconnect: true,
+      shouldRetryOnError: false
+    }
+  );
+
+  useEffect(() => {
+    if (!restoredSession) {
+      return;
+    }
+    setSession(restoredSession);
+  }, [restoredSession, setSession]);
+
+  useEffect(() => {
+    if (!session || !snapshot) {
+      selfSeatedRef.current = false;
+      return;
+    }
+    selfSeatedRef.current = snapshot.players.some((player) => player.player_id === session.player_id);
+  }, [session, snapshot]);
+
   const walletKey = session ? "/v1/wallet" : null;
-  const { data: wallet, isLoading: walletLoading } = useSWR<WalletResponse>(
+  const { data: wallet, error: walletError, isLoading: walletLoading } = useSWR<WalletResponse>(
     walletKey,
     fetchJSON,
     {
@@ -64,6 +90,7 @@ export function usePlayConsole() {
     (nextSession: SessionSnapshot) => {
       setSession(nextSession);
       appendEvent(`SESSION ${nextSession.player_id} (${nextSession.nickname})`);
+      void mutate("/v1/session/current", nextSession, { revalidate: false });
       void mutate("/v1/wallet");
     },
     [appendEvent, mutate, setSession]
@@ -262,6 +289,7 @@ export function usePlayConsole() {
     }
     ws.close();
     wsRef.current = null;
+    selfSeatedRef.current = false;
   }, []);
 
   const logout = useCallback(async () => {
@@ -277,6 +305,7 @@ export function usePlayConsole() {
       });
     } finally {
       clearSession();
+      void mutate("/v1/session/current", null, { revalidate: false });
       void mutate("/v1/wallet", undefined, { revalidate: false });
       appendEvent("LOGOUT");
     }
@@ -300,7 +329,17 @@ export function usePlayConsole() {
       try {
         const parsed = JSON.parse(event.data) as ServerEnvelope;
         if (parsed.event_type === "table_snapshot") {
-          setSnapshot(parsed.payload as TableSnapshot);
+          const nextSnapshot = parsed.payload as TableSnapshot;
+          const selfPlayerID = session?.player_id ?? "";
+          if (selfPlayerID !== "") {
+            const wasSeated = selfSeatedRef.current;
+            const isSeatedNow = nextSnapshot.players.some((player) => player.player_id === selfPlayerID);
+            selfSeatedRef.current = isSeatedNow;
+            if (wasSeated && !isSeatedNow) {
+              void mutate("/v1/wallet");
+            }
+          }
+          setSnapshot(nextSnapshot);
         }
         if (parsed.event_type === "error_notice") {
           const noticePayload = parsed.payload as { code?: string; message?: string };
@@ -326,7 +365,7 @@ export function usePlayConsole() {
       setLastError("websocket error");
       appendEvent("WS_ERROR");
     };
-  }, [appendEvent, clearLastError, closeSocket, setLastError]);
+  }, [appendEvent, clearLastError, closeSocket, mutate, session, setLastError]);
 
   const sendEvent = useCallback(
     (eventType: string, payload: Record<string, unknown>) => {
@@ -426,6 +465,7 @@ export function usePlayConsole() {
     status,
     health,
     wallet,
+    walletError: walletError instanceof Error ? walletError.message : "",
     walletLoading,
     session,
     notice,
@@ -450,6 +490,18 @@ async function fetchJSON<T>(url: string): Promise<T> {
     throw new Error(errorText || `request failed: ${response.status}`);
   }
   return (await response.json()) as T;
+}
+
+async function fetchCurrentSession(url: string): Promise<SessionSnapshot | null> {
+  const response = await fetch(url, { credentials: "include" });
+  if (response.status === 401) {
+    return null;
+  }
+  if (!response.ok) {
+    const errorText = (await response.text()).trim();
+    throw new Error(errorText || `request failed: ${response.status}`);
+  }
+  return (await response.json()) as SessionSnapshot;
 }
 
 function createRequestId() {

@@ -101,6 +101,55 @@ func TestGuestSessionSetsCookie(t *testing.T) {
 	}
 }
 
+func TestCurrentSessionReturnsSessionFromCookie(t *testing.T) {
+	app := newTestApp()
+	server := httptest.NewServer(app.Handler())
+	defer server.Close()
+
+	cookie := issueGuestCookie(t, server.URL)
+
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/v1/session/current", nil)
+	if err != nil {
+		t.Fatalf("failed to create current session request: %v", err)
+	}
+	req.AddCookie(cookie)
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("failed to call current session endpoint: %v", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected current session status code: got=%d want=%d", res.StatusCode, http.StatusOK)
+	}
+
+	var payload struct {
+		PlayerID string `json:"player_id"`
+		Nickname string `json:"nickname"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
+		t.Fatalf("failed to decode current session response: %v", err)
+	}
+	if payload.PlayerID == "" || payload.Nickname == "" {
+		t.Fatalf("expected non-empty player_id and nickname in current session response")
+	}
+}
+
+func TestCurrentSessionRejectsWithoutCookie(t *testing.T) {
+	app := newTestApp()
+	req := httptest.NewRequest(http.MethodGet, "/v1/session/current", nil)
+	rec := httptest.NewRecorder()
+
+	app.Handler().ServeHTTP(rec, req)
+	res := rec.Result()
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unexpected status code: got=%d want=%d", res.StatusCode, http.StatusUnauthorized)
+	}
+}
+
 func TestGuestSessionRejectsDuplicateNickname(t *testing.T) {
 	app := newTestApp()
 	server := httptest.NewServer(app.Handler())
@@ -363,6 +412,63 @@ func TestWalletEndpointReturnsCurrentBalance(t *testing.T) {
 	}
 }
 
+func TestLeaveTableRefundsRemainingStackToWallet(t *testing.T) {
+	app := newTestApp()
+	server := httptest.NewServer(app.Handler())
+	defer server.Close()
+
+	cookie := issueGuestCookie(t, server.URL)
+	createBuyIn(t, server.URL, cookie, "table-1", 400)
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
+	conn := dialWSWithCookie(t, wsURL, cookie)
+	defer conn.Close()
+
+	_ = readSnapshotEnvelope(t, conn)
+
+	sendJoinTable(t, conn, "table-1")
+	joined := readSnapshotEnvelope(t, conn)
+	if joined.Payload.ActivePlayers != 1 {
+		t.Fatalf("unexpected active players after join: got=%d want=1", joined.Payload.ActivePlayers)
+	}
+
+	sendLeaveTable(t, conn, "table-1")
+	left := readSnapshotEnvelope(t, conn)
+	if left.Payload.ActivePlayers != 0 {
+		t.Fatalf("unexpected active players after leave: got=%d want=0", left.Payload.ActivePlayers)
+	}
+
+	balanceAfterLeave := readWalletBalance(t, server.URL, cookie)
+	if balanceAfterLeave != 2000 {
+		t.Fatalf("unexpected wallet balance after leave refund: got=%d want=%d", balanceAfterLeave, 2000)
+	}
+}
+
+func TestDisconnectRefundsRemainingStackToWallet(t *testing.T) {
+	app := newTestApp()
+	server := httptest.NewServer(app.Handler())
+	defer server.Close()
+
+	cookie := issueGuestCookie(t, server.URL)
+	createBuyIn(t, server.URL, cookie, "table-1", 350)
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
+	conn := dialWSWithCookie(t, wsURL, cookie)
+
+	_ = readSnapshotEnvelope(t, conn)
+	sendJoinTable(t, conn, "table-1")
+	joined := readSnapshotEnvelope(t, conn)
+	if joined.Payload.ActivePlayers != 1 {
+		t.Fatalf("unexpected active players after join: got=%d want=1", joined.Payload.ActivePlayers)
+	}
+
+	if err := conn.Close(); err != nil {
+		t.Fatalf("failed to close websocket connection: %v", err)
+	}
+
+	waitForWalletBalance(t, server.URL, cookie, 2000, 2*time.Second)
+}
+
 func TestWebSocketRejectsWithoutCookie(t *testing.T) {
 	app := newTestApp()
 	server := httptest.NewServer(app.Handler())
@@ -558,6 +664,21 @@ func sendJoinTableWithRequestID(t *testing.T, conn *websocket.Conn, tableID, req
 	}
 }
 
+func sendLeaveTable(t *testing.T, conn *websocket.Conn, tableID string) {
+	t.Helper()
+
+	event := protocol.ClientEnvelope{
+		EventType: "leave_table",
+		RequestID: createRequestIDForTest(),
+		Payload:   mustRawMessage(t, protocol.LeaveTablePayload{TableID: tableID}),
+	}
+
+	_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
+	if err := conn.WriteJSON(event); err != nil {
+		t.Fatalf("failed to send leave_table: %v", err)
+	}
+}
+
 func readSnapshot(t *testing.T, conn *websocket.Conn) protocol.TableSnapshotPayload {
 	return readSnapshotEnvelope(t, conn).Payload
 }
@@ -685,6 +806,27 @@ func readWalletBalance(t *testing.T, baseURL string, cookie *http.Cookie) int64 
 		t.Fatalf("failed to decode wallet response: %v", err)
 	}
 	return payload.Balance
+}
+
+func waitForWalletBalance(t *testing.T, baseURL string, cookie *http.Cookie, want int64, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	var last int64
+	for {
+		last = readWalletBalance(t, baseURL, cookie)
+		if last == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("wallet balance did not converge: got=%d want=%d timeout=%s", last, want, timeout.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func createRequestIDForTest() string {
+	return "req_" + strconv.FormatInt(time.Now().UnixNano(), 10)
 }
 
 type fakeSnapshotStore struct {

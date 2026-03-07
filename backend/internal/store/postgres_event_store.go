@@ -180,6 +180,33 @@ func (s *postgresEventStore) GetWalletBalance(ctx context.Context, playerID stri
 	return balance, nil
 }
 
+// CreditWallet는 플레이어 지갑에 금액을 더하고 반영된 잔액을 반환한다.
+func (s *postgresEventStore) CreditWallet(ctx context.Context, playerID string, amount int64) (int64, error) {
+	if amount < 0 {
+		return 0, ErrInvalidWalletCreditAmount
+	}
+
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO wallets (player_id, balance)
+		VALUES ($1, $2)
+		ON CONFLICT (player_id) DO NOTHING
+	`, playerID, int64(0)); err != nil {
+		return 0, fmt.Errorf("failed to ensure wallet before credit: %w", err)
+	}
+
+	var updatedBalance int64
+	if err := s.pool.QueryRow(ctx, `
+		UPDATE wallets
+		SET balance = balance + $2, updated_at = NOW()
+		WHERE player_id = $1
+		RETURNING balance
+	`, playerID, amount).Scan(&updatedBalance); err != nil {
+		return 0, fmt.Errorf("failed to credit wallet balance: %w", err)
+	}
+
+	return updatedBalance, nil
+}
+
 // CreateBuyIn은 바이인 금액 검증/지갑 차감/바이인 생성을 원자적으로 처리한다.
 func (s *postgresEventStore) CreateBuyIn(ctx context.Context, playerID, tableID string, amount int64) (BuyInReceipt, error) {
 	tx, err := s.pool.Begin(ctx)

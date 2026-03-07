@@ -4,7 +4,7 @@ tmp_dir = "tmp"
 
 [build]
 cmd = "go build -o ./tmp/cc-poker-backend-dev.exe ./cmd/server"
-bin = "./tmp/cc-poker-backend-dev.exe"
+entrypoint = ["./tmp/cc-poker-backend-dev.exe"]
 full_bin = ""
 include_ext = ["go", "tpl", "tmpl", "html", "env"]
 exclude_dir = ["tmp", "vendor", ".git"]
@@ -17,7 +17,6 @@ delay = 300
 stop_on_error = true
 send_interrupt = true
 kill_delay = 500
-poll = false
 poll = true
 poll_interval = 700
 

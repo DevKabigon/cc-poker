@@ -182,6 +182,18 @@ a:not([data-slot="button"]):hover {
   grid-template-columns: 1.5fr 1fr;
 }
 
+.room-grid,
+.table-select-grid {
+  margin-top: 16px;
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+
+.room-card {
+  min-height: 220px;
+}
+
 .seat-map {
   display: grid;
   gap: 10px;

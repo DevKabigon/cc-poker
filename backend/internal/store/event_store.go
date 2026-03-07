@@ -44,6 +44,8 @@ var (
 	ErrInsufficientBalance = errors.New("insufficient balance")
 	// ErrPendingBuyInNotFound는 소비 가능한 바이인이 없을 때 반환된다.
 	ErrPendingBuyInNotFound = errors.New("pending buy-in not found")
+	// ErrInvalidWalletCreditAmount는 월렛 환급 금액이 유효하지 않을 때 반환된다.
+	ErrInvalidWalletCreditAmount = errors.New("invalid wallet credit amount")
 )
 
 // EventStore는 세션/테이블 이벤트의 영속화를 담당한다.
@@ -51,6 +53,7 @@ type EventStore interface {
 	SeedRoomsAndTables(ctx context.Context) error
 	EnsureWallet(ctx context.Context, playerID string, initialBalance int64) error
 	GetWalletBalance(ctx context.Context, playerID string) (int64, error)
+	CreditWallet(ctx context.Context, playerID string, amount int64) (int64, error)
 	CreateBuyIn(ctx context.Context, playerID, tableID string, amount int64) (BuyInReceipt, error)
 	ConsumePendingBuyIn(ctx context.Context, playerID, tableID string) (BuyInReceipt, error)
 	IsNicknameTaken(ctx context.Context, nickname string) (bool, error)
@@ -92,6 +95,20 @@ func (n *noopEventStore) GetWalletBalance(_ context.Context, playerID string) (i
 	defer n.mu.Unlock()
 
 	return n.balances[playerID], nil
+}
+
+func (n *noopEventStore) CreditWallet(_ context.Context, playerID string, amount int64) (int64, error) {
+	if amount < 0 {
+		return 0, ErrInvalidWalletCreditAmount
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	current := n.balances[playerID]
+	updated := current + amount
+	n.balances[playerID] = updated
+	return updated, nil
 }
 
 func (n *noopEventStore) CreateBuyIn(_ context.Context, playerID, tableID string, amount int64) (BuyInReceipt, error) {

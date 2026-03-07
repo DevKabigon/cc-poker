@@ -48,6 +48,15 @@ type authExchangeResponse struct {
 	ExpiresAt     string `json:"expires_at"`
 }
 
+type currentSessionResponse struct {
+	PlayerID      string `json:"player_id"`
+	Nickname      string `json:"nickname"`
+	UserType      string `json:"user_type"`
+	Email         string `json:"email,omitempty"`
+	EmailVerified bool   `json:"email_verified"`
+	ExpiresAt     string `json:"expires_at"`
+}
+
 type nicknameCheckRequest struct {
 	Nickname string `json:"nickname"`
 }
@@ -234,6 +243,7 @@ func (a *App) Handler() http.Handler {
 func (a *App) registerRoutes() {
 	a.mux.HandleFunc("/health", a.handleHealth)
 	a.mux.HandleFunc("/v1/session/guest", a.handleGuestSession)
+	a.mux.HandleFunc("/v1/session/current", a.handleCurrentSession)
 	a.mux.HandleFunc("/v1/auth/nickname/check", a.handleNicknameCheck)
 	a.mux.HandleFunc("/v1/auth/exchange", a.handleAuthExchange)
 	a.mux.HandleFunc("/v1/auth/logout", a.handleAuthLogout)
@@ -337,6 +347,29 @@ func (a *App) handleGuestSession(w http.ResponseWriter, r *http.Request) {
 		Nickname:  created.Nickname,
 		UserType:  created.UserType,
 		ExpiresAt: created.ExpiresAt.UTC().Format(time.RFC3339),
+	})
+}
+
+// handleCurrentSession은 세션 쿠키 기준으로 현재 로그인 정보를 반환한다.
+func (a *App) handleCurrentSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	playerSession, ok := a.authFromCookie(r)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, currentSessionResponse{
+		PlayerID:      playerSession.PlayerID,
+		Nickname:      playerSession.Nickname,
+		UserType:      playerSession.UserType,
+		Email:         playerSession.Email,
+		EmailVerified: playerSession.EmailVerified,
+		ExpiresAt:     playerSession.ExpiresAt.UTC().Format(time.RFC3339),
 	})
 }
 
@@ -595,12 +628,16 @@ func (a *App) dispatchClientEvent(client *wsClient, envelope protocol.ClientEnve
 func (a *App) closeClient(client *wsClient) {
 	if client.IsSeated() {
 		tableID := client.CurrentTableID()
+		stack, hasStack := a.currentPlayerStack(tableID, client.PlayerID())
 		snapshot, seq, err := a.tables.Leave(tableID, client.PlayerID())
 		if err != nil && !errors.Is(err, table.ErrPlayerNotFound) {
 			a.logger.Printf("failed to leave table on disconnect: player=%s table=%s err=%v", client.PlayerID(), tableID, err)
 		}
 
 		if err == nil {
+			if hasStack {
+				a.refundStackToWallet(client.PlayerID(), tableID, stack)
+			}
 			a.broadcastSnapshot(tableID, snapshot, seq)
 			a.persistSnapshot(snapshot, seq)
 			a.persistTableEvent("disconnect_leave", client.PlayerID(), snapshot, seq)
@@ -645,12 +682,17 @@ func (a *App) handleJoinTableEvent(client *wsClient, payload json.RawMessage) ([
 
 	// 다른 테이블에 이미 앉아 있다면 기존 테이블에서 먼저 퇴장 처리한다.
 	if seated && currentTableID != tableID {
+		previousStack, hadPreviousStack := a.currentPlayerStack(currentTableID, client.PlayerID())
 		previousSnapshot, previousSeq, leaveErr := a.tables.Leave(currentTableID, client.PlayerID())
 		if leaveErr != nil && !errors.Is(leaveErr, table.ErrPlayerNotFound) {
+			a.refundStackToWallet(client.PlayerID(), tableID, stack)
 			return nil, leaveErr
 		}
 		client.SetTableState(currentTableID, false)
 		if leaveErr == nil {
+			if hadPreviousStack {
+				a.refundStackToWallet(client.PlayerID(), currentTableID, previousStack)
+			}
 			a.broadcastSnapshot(currentTableID, previousSnapshot, previousSeq)
 			a.persistSnapshot(previousSnapshot, previousSeq)
 			a.persistTableEvent("switch_leave", client.PlayerID(), previousSnapshot, previousSeq)
@@ -659,6 +701,7 @@ func (a *App) handleJoinTableEvent(client *wsClient, payload json.RawMessage) ([
 
 	snapshot, seq, err := a.tables.Join(tableID, client.PlayerID(), client.Nickname(), stack, joinReq.SeatIndex)
 	if err != nil {
+		a.refundStackToWallet(client.PlayerID(), tableID, stack)
 		code, message := tableErrorToNotice(err)
 		return a.sendErrorNotice(client, code, message)
 	}
@@ -683,12 +726,16 @@ func (a *App) handleLeaveTableEvent(client *wsClient, payload json.RawMessage) (
 		tableID = a.resolveTableID(leaveReq.TableID)
 	}
 
+	stack, hasStack := a.currentPlayerStack(tableID, client.PlayerID())
 	snapshot, seq, err := a.tables.Leave(tableID, client.PlayerID())
 	if err != nil {
 		code, message := tableErrorToNotice(err)
 		return a.sendErrorNotice(client, code, message)
 	}
 
+	if hasStack {
+		a.refundStackToWallet(client.PlayerID(), tableID, stack)
+	}
 	client.SetTableState(tableID, false)
 	envelope := a.broadcastSnapshot(tableID, snapshot, seq)
 	a.persistSnapshot(snapshot, seq)
@@ -819,6 +866,34 @@ func (a *App) consumePendingBuyIn(playerID, tableID string) (int64, error) {
 		return 0, err
 	}
 	return receipt.Amount, nil
+}
+
+func (a *App) currentPlayerStack(tableID, playerID string) (int64, bool) {
+	snapshot, _ := a.tables.Snapshot(tableID)
+	for _, seatedPlayer := range snapshot.Players {
+		if seatedPlayer.PlayerID == playerID {
+			return seatedPlayer.Stack, true
+		}
+	}
+	return 0, false
+}
+
+// refundStackToWallet는 테이블 퇴장 시 남은 스택을 월렛으로 환급한다.
+func (a *App) refundStackToWallet(playerID, tableID string, amount int64) {
+	if amount <= 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.PostgresTimeout)
+	defer cancel()
+
+	updatedBalance, err := a.eventStore.CreditWallet(ctx, playerID, amount)
+	if err != nil {
+		a.logger.Printf("failed to refund stack to wallet: player=%s table=%s amount=%d err=%v", playerID, tableID, amount, err)
+		return
+	}
+
+	a.logger.Printf("refunded stack to wallet: player=%s table=%s amount=%d balance_after=%d", playerID, tableID, amount, updatedBalance)
 }
 
 func (a *App) prevalidateJoinSeat(tableID string, seatIndex *int) error {
