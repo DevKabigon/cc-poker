@@ -292,6 +292,12 @@ export function usePlayConsole() {
     selfSeatedRef.current = false;
   }, []);
 
+  useEffect(() => {
+    return () => {
+      closeSocket();
+    };
+  }, [closeSocket]);
+
   const logout = useCallback(async () => {
     clearLastError();
     closeSocket();
