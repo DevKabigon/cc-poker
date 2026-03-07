@@ -17,10 +17,13 @@ var (
 
 // PlayerSession은 플레이어의 인증 세션 정보를 나타낸다.
 type PlayerSession struct {
-	SessionID string
-	PlayerID  string
-	Nickname  string
-	ExpiresAt time.Time
+	SessionID     string
+	PlayerID      string
+	Nickname      string
+	UserType      string
+	Email         string
+	EmailVerified bool
+	ExpiresAt     time.Time
 }
 
 // Store는 메모리 기반 세션 저장소다.
@@ -53,21 +56,49 @@ func (s *Store) CreateGuest(nickname string, ttl time.Duration) (PlayerSession, 
 		return PlayerSession{}, fmt.Errorf("failed to generate player id: %w", err)
 	}
 
-	return s.Create(playerID, nickname, ttl)
+	return s.create(playerID, nickname, ttl, "guest", "", false)
 }
 
 // Create는 지정된 플레이어 ID로 세션을 생성하고 저장한다.
 func (s *Store) Create(playerID, nickname string, ttl time.Duration) (PlayerSession, error) {
+	return s.create(playerID, nickname, ttl, "auth", "", false)
+}
+
+// IsNicknameTaken은 메모리 세션 기준으로 닉네임 점유 여부를 반환한다.
+func (s *Store) IsNicknameTaken(nickname string) bool {
+	canonical := canonicalizeNickname(nickname)
+	if canonical == "" {
+		return false
+	}
+
+	s.mu.RLock()
+	_, exists := s.nicknameOwners[canonical]
+	s.mu.RUnlock()
+	return exists
+}
+
+func (s *Store) create(
+	playerID, nickname string,
+	ttl time.Duration,
+	userType, email string,
+	emailVerified bool,
+) (PlayerSession, error) {
 	sessionID, err := newID("ses")
 	if err != nil {
 		return PlayerSession{}, fmt.Errorf("failed to generate session id: %w", err)
 	}
 
 	session := PlayerSession{
-		SessionID: sessionID,
-		PlayerID:  playerID,
-		Nickname:  normalizeNickname(nickname, playerID),
-		ExpiresAt: s.now().Add(ttl),
+		SessionID:     sessionID,
+		PlayerID:      playerID,
+		Nickname:      normalizeNickname(nickname, playerID),
+		UserType:      strings.TrimSpace(userType),
+		Email:         strings.TrimSpace(email),
+		EmailVerified: emailVerified,
+		ExpiresAt:     s.now().Add(ttl),
+	}
+	if session.UserType == "" {
+		session.UserType = "guest"
 	}
 
 	s.mu.Lock()
@@ -93,7 +124,7 @@ func (s *Store) Create(playerID, nickname string, ttl time.Duration) (PlayerSess
 // Delete는 세션 ID를 기준으로 메모리 세션을 제거한다.
 func (s *Store) Delete(sessionID string) {
 	s.mu.Lock()
-	delete(s.sessions, sessionID)
+	s.deleteSessionLocked(sessionID)
 	s.mu.Unlock()
 }
 
@@ -108,7 +139,7 @@ func (s *Store) FindValid(sessionID string) (PlayerSession, bool) {
 
 	if !session.ExpiresAt.After(s.now()) {
 		s.mu.Lock()
-		delete(s.sessions, sessionID)
+		s.deleteSessionLocked(sessionID)
 		s.mu.Unlock()
 		return PlayerSession{}, false
 	}
@@ -144,4 +175,32 @@ func normalizeNickname(input, playerID string) string {
 
 func canonicalizeNickname(input string) string {
 	return strings.ToLower(strings.TrimSpace(input))
+}
+
+func (s *Store) deleteSessionLocked(sessionID string) {
+	session, exists := s.sessions[sessionID]
+	if !exists {
+		return
+	}
+
+	delete(s.sessions, sessionID)
+	s.releaseNicknameIfUnusedLocked(session.PlayerID)
+}
+
+func (s *Store) releaseNicknameIfUnusedLocked(playerID string) {
+	for _, existing := range s.sessions {
+		if existing.PlayerID == playerID {
+			return
+		}
+	}
+
+	canonicalNickname, exists := s.playerNicknames[playerID]
+	if !exists {
+		return
+	}
+
+	if ownerPlayerID, ownerExists := s.nicknameOwners[canonicalNickname]; ownerExists && ownerPlayerID == playerID {
+		delete(s.nicknameOwners, canonicalNickname)
+	}
+	delete(s.playerNicknames, playerID)
 }

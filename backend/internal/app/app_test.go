@@ -141,6 +141,94 @@ func TestGuestSessionRejectsDuplicateNickname(t *testing.T) {
 	}
 }
 
+func TestNicknameCheckDetectsTakenNickname(t *testing.T) {
+	app := newTestApp()
+	server := httptest.NewServer(app.Handler())
+	defer server.Close()
+
+	createBody := bytes.NewBufferString(`{"nickname":"CheckNick01"}`)
+	createReq, err := http.NewRequest(http.MethodPost, server.URL+"/v1/session/guest", createBody)
+	if err != nil {
+		t.Fatalf("failed to create guest request: %v", err)
+	}
+	createReq.Header.Set("Content-Type", "application/json")
+
+	createRes, err := http.DefaultClient.Do(createReq)
+	if err != nil {
+		t.Fatalf("failed to create guest session: %v", err)
+	}
+	defer createRes.Body.Close()
+
+	if createRes.StatusCode != http.StatusCreated {
+		t.Fatalf("unexpected guest status code: got=%d want=%d", createRes.StatusCode, http.StatusCreated)
+	}
+
+	takenBody := bytes.NewBufferString(`{"nickname":"checknick01"}`)
+	takenReq, err := http.NewRequest(http.MethodPost, server.URL+"/v1/auth/nickname/check", takenBody)
+	if err != nil {
+		t.Fatalf("failed to create nickname check request: %v", err)
+	}
+	takenReq.Header.Set("Content-Type", "application/json")
+
+	takenRes, err := http.DefaultClient.Do(takenReq)
+	if err != nil {
+		t.Fatalf("failed to call nickname check endpoint: %v", err)
+	}
+	defer takenRes.Body.Close()
+
+	if takenRes.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected nickname check status code: got=%d want=%d", takenRes.StatusCode, http.StatusOK)
+	}
+
+	var takenPayload map[string]bool
+	if err := json.NewDecoder(takenRes.Body).Decode(&takenPayload); err != nil {
+		t.Fatalf("failed to decode nickname check response: %v", err)
+	}
+	if available, ok := takenPayload["available"]; !ok || available {
+		t.Fatalf("expected nickname to be unavailable")
+	}
+
+	availableBody := bytes.NewBufferString(`{"nickname":"CheckNick02"}`)
+	availableReq, err := http.NewRequest(http.MethodPost, server.URL+"/v1/auth/nickname/check", availableBody)
+	if err != nil {
+		t.Fatalf("failed to create nickname check request: %v", err)
+	}
+	availableReq.Header.Set("Content-Type", "application/json")
+
+	availableRes, err := http.DefaultClient.Do(availableReq)
+	if err != nil {
+		t.Fatalf("failed to call nickname check endpoint: %v", err)
+	}
+	defer availableRes.Body.Close()
+
+	if availableRes.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected nickname check status code: got=%d want=%d", availableRes.StatusCode, http.StatusOK)
+	}
+
+	var availablePayload map[string]bool
+	if err := json.NewDecoder(availableRes.Body).Decode(&availablePayload); err != nil {
+		t.Fatalf("failed to decode nickname check response: %v", err)
+	}
+	if available, ok := availablePayload["available"]; !ok || !available {
+		t.Fatalf("expected nickname to be available")
+	}
+}
+
+func TestNicknameCheckRejectsEmptyNickname(t *testing.T) {
+	app := newTestApp()
+	req := httptest.NewRequest(http.MethodPost, "/v1/auth/nickname/check", bytes.NewBufferString(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	app.Handler().ServeHTTP(rec, req)
+	res := rec.Result()
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unexpected status code: got=%d want=%d", res.StatusCode, http.StatusBadRequest)
+	}
+}
+
 func TestAuthExchangeRejectsUnverifiedEmail(t *testing.T) {
 	app := newTestAppWithAuthVerifier(fakeAuthVerifier{
 		user: auth.User{

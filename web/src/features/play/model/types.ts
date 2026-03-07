@@ -25,6 +25,20 @@ export type SupabaseLoginResponse = {
   access_token: string;
 };
 
+export type SupabaseSignupResponse = {
+  user?: {
+    identities?: unknown[] | null;
+  } | null;
+  session?: unknown | null;
+  error?: string;
+  error_description?: string;
+  msg?: string;
+};
+
+export type NicknameCheckResponse = {
+  available: boolean;
+};
+
 export type HealthResponse = {
   status: string;
   service: string;
@@ -37,4 +51,3 @@ export type UiNotice = {
   kind: "success" | "info";
   message: string;
 } | null;
-

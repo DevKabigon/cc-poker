@@ -82,7 +82,7 @@ export function AuthPage() {
               <Button onClick={createGuestSession} disabled={!nickname.trim()}>
                 게스트 시작
               </Button>
-              <Button variant="outline" onClick={signUpWithSupabase}>
+              <Button variant="outline" onClick={signUpWithSupabase} disabled={!nickname.trim()}>
                 회원가입
               </Button>
               <Button variant="outline" onClick={signInWithSupabase}>

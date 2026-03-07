@@ -332,6 +332,26 @@ func (s *postgresEventStore) ConsumePendingBuyIn(ctx context.Context, playerID, 
 	return receipt, nil
 }
 
+// IsNicknameTaken은 users 테이블 기준 닉네임 중복 여부를 조회한다.
+func (s *postgresEventStore) IsNicknameTaken(ctx context.Context, nickname string) (bool, error) {
+	trimmed := strings.TrimSpace(nickname)
+	if trimmed == "" {
+		return false, nil
+	}
+
+	var exists bool
+	if err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1
+			FROM users
+			WHERE LOWER(nickname) = LOWER($1)
+		)
+	`, trimmed).Scan(&exists); err != nil {
+		return false, fmt.Errorf("failed to check nickname duplication: %w", err)
+	}
+	return exists, nil
+}
+
 // SaveSession은 유저/세션 정보를 저장한다.
 func (s *postgresEventStore) SaveSession(ctx context.Context, playerSession session.PlayerSession) error {
 	tx, err := s.pool.Begin(ctx)
@@ -341,10 +361,17 @@ func (s *postgresEventStore) SaveSession(ctx context.Context, playerSession sess
 	defer tx.Rollback(ctx)
 
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO users (id, nickname)
-		VALUES ($1, $2)
-		ON CONFLICT (id) DO UPDATE SET nickname = EXCLUDED.nickname
-	`, playerSession.PlayerID, playerSession.Nickname); err != nil {
+		INSERT INTO users (id, nickname, user_type, email, email_verified)
+		VALUES ($1, $2, $3, NULLIF($4, ''), $5)
+		ON CONFLICT (id) DO UPDATE
+		SET nickname = EXCLUDED.nickname,
+			user_type = EXCLUDED.user_type,
+			email = COALESCE(EXCLUDED.email, users.email),
+			email_verified = CASE
+				WHEN EXCLUDED.email IS NULL THEN users.email_verified
+				ELSE EXCLUDED.email_verified
+			END
+	`, playerSession.PlayerID, playerSession.Nickname, playerSession.UserType, playerSession.Email, playerSession.EmailVerified); err != nil {
 		if isNicknameUniqueViolation(err) {
 			return ErrNicknameTaken
 		}

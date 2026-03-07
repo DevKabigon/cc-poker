@@ -4,9 +4,11 @@ import { useAppStore, type SessionSnapshot } from "../../../store/useAppStore";
 import type {
   ConnectionStatus,
   HealthResponse,
+  NicknameCheckResponse,
   ServerEnvelope,
   SnapshotPlayer,
   SupabaseLoginResponse,
+  SupabaseSignupResponse,
   TableSnapshot,
   UiNotice
 } from "./types";
@@ -97,7 +99,14 @@ export function usePlayConsole() {
       });
 
       if (!response.ok) {
-        throw new Error(`guest session failed: ${response.status}`);
+        const errorText = (await response.text()).trim().toLowerCase();
+        if (response.status === 409 || errorText.includes("nickname is already taken")) {
+          throw new Error("이미 사용중인 닉네임입니다.");
+        }
+        if (response.status === 400 && errorText.includes("nickname is required")) {
+          throw new Error("닉네임을 입력해주세요.");
+        }
+        throw new Error(`게스트 세션 생성에 실패했습니다. (${response.status})`);
       }
 
       const data = (await response.json()) as SessionSnapshot;
@@ -119,6 +128,23 @@ export function usePlayConsole() {
       if (!email.trim() || !password.trim()) {
         throw new Error("email and password are required");
       }
+      if (!nickname.trim()) {
+        throw new Error("닉네임을 입력해주세요.");
+      }
+
+      const nicknameCheckResponse = await fetch("/v1/auth/nickname/check", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ nickname })
+      });
+      if (!nicknameCheckResponse.ok) {
+        throw new Error("닉네임 중복 확인에 실패했습니다. 잠시 후 다시 시도해주세요.");
+      }
+      const nicknameCheck = (await nicknameCheckResponse.json()) as NicknameCheckResponse;
+      if (!nicknameCheck.available) {
+        throw new Error("이미 사용중인 닉네임입니다.");
+      }
 
       const response = await fetch(`${SUPABASE_URL}/auth/v1/signup`, {
         method: "POST",
@@ -132,10 +158,26 @@ export function usePlayConsole() {
           data: { nickname }
         })
       });
+      const rawPayload = await response.text();
+      const payload = parseJSONSafely<SupabaseSignupResponse>(rawPayload);
 
       if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`signup failed: ${response.status} ${errorText}`);
+        const detail =
+          payload?.msg ?? payload?.error_description ?? payload?.error ?? rawPayload.trim();
+        if (detail.toLowerCase().includes("already")) {
+          throw new Error("이미 가입된 이메일입니다. 로그인해주세요.");
+        }
+        throw new Error(`회원가입에 실패했습니다. (${response.status}) ${detail}`);
+      }
+
+      const signupDetail =
+        payload?.msg ?? payload?.error_description ?? payload?.error ?? "";
+      if (signupDetail.toLowerCase().includes("already")) {
+        throw new Error("이미 가입된 이메일입니다. 로그인해주세요.");
+      }
+      const identities = payload?.user?.identities;
+      if (Array.isArray(identities) && identities.length === 0) {
+        throw new Error("이미 가입된 이메일입니다. 로그인해주세요.");
       }
 
       appendEvent("SIGNUP_OK verify your email");
@@ -372,4 +414,15 @@ function createRequestId() {
     return crypto.randomUUID();
   }
   return `req_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function parseJSONSafely<T>(rawText: string): T | null {
+  if (!rawText.trim()) {
+    return null;
+  }
+  try {
+    return JSON.parse(rawText) as T;
+  } catch {
+    return null;
+  }
 }

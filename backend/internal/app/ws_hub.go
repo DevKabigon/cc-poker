@@ -204,3 +204,17 @@ func (h *wsHub) clientsForTable(tableID string) []*wsClient {
 	}
 	return out
 }
+
+func (h *wsHub) clientsForPlayer(playerID string) []*wsClient {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	out := make([]*wsClient, 0, len(h.clients))
+	for client := range h.clients {
+		if client.PlayerID() != playerID {
+			continue
+		}
+		out = append(out, client)
+	}
+	return out
+}

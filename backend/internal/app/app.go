@@ -30,6 +30,7 @@ type guestSessionRequest struct {
 type guestSessionResponse struct {
 	PlayerID  string `json:"player_id"`
 	Nickname  string `json:"nickname"`
+	UserType  string `json:"user_type"`
 	ExpiresAt string `json:"expires_at"`
 }
 
@@ -41,9 +42,18 @@ type authExchangeRequest struct {
 type authExchangeResponse struct {
 	PlayerID      string `json:"player_id"`
 	Nickname      string `json:"nickname"`
+	UserType      string `json:"user_type"`
 	Email         string `json:"email"`
 	EmailVerified bool   `json:"email_verified"`
 	ExpiresAt     string `json:"expires_at"`
+}
+
+type nicknameCheckRequest struct {
+	Nickname string `json:"nickname"`
+}
+
+type nicknameCheckResponse struct {
+	Available bool `json:"available"`
 }
 
 type tableBuyInRequest struct {
@@ -217,6 +227,7 @@ func (a *App) Handler() http.Handler {
 func (a *App) registerRoutes() {
 	a.mux.HandleFunc("/health", a.handleHealth)
 	a.mux.HandleFunc("/v1/session/guest", a.handleGuestSession)
+	a.mux.HandleFunc("/v1/auth/nickname/check", a.handleNicknameCheck)
 	a.mux.HandleFunc("/v1/auth/exchange", a.handleAuthExchange)
 	a.mux.HandleFunc("/v1/auth/logout", a.handleAuthLogout)
 	a.mux.HandleFunc("/v1/tables/buy-in", a.handleTableBuyIn)
@@ -230,6 +241,46 @@ func (a *App) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		Service:   "cc-poker-backend",
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 	})
+}
+
+// handleNicknameCheck은 닉네임 사용 가능 여부를 검사한다.
+func (a *App) handleNicknameCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req nicknameCheckRequest
+	if r.Body != nil {
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			http.Error(w, "invalid json body", http.StatusBadRequest)
+			return
+		}
+	}
+
+	nickname := strings.TrimSpace(req.Nickname)
+	if nickname == "" {
+		http.Error(w, "nickname is required", http.StatusBadRequest)
+		return
+	}
+
+	if a.sessions.IsNicknameTaken(nickname) {
+		writeJSON(w, http.StatusOK, nicknameCheckResponse{Available: false})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.PostgresTimeout)
+	defer cancel()
+
+	isTaken, err := a.eventStore.IsNicknameTaken(ctx, nickname)
+	if err != nil {
+		a.logger.Printf("failed to check nickname availability: nickname=%s err=%v", nickname, err)
+		http.Error(w, "failed to check nickname", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, nicknameCheckResponse{Available: !isTaken})
 }
 
 // handleGuestSession은 게스트 세션을 발급하고 쿠키를 설정한다.
@@ -252,6 +303,7 @@ func (a *App) handleGuestSession(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "nickname is required", http.StatusBadRequest)
 		return
 	}
+	a.revokeSessionFromCookie(r)
 
 	created, err := a.sessions.CreateGuest(req.Nickname, a.cfg.SessionTTL)
 	if err != nil {
@@ -275,6 +327,7 @@ func (a *App) handleGuestSession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, guestSessionResponse{
 		PlayerID:  created.PlayerID,
 		Nickname:  created.Nickname,
+		UserType:  created.UserType,
 		ExpiresAt: created.ExpiresAt.UTC().Format(time.RFC3339),
 	})
 }
@@ -307,6 +360,7 @@ func (a *App) handleAuthExchange(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, message, statusCode)
 		return
 	}
+	a.revokeSessionFromCookie(r)
 
 	playerID := authUserToPlayerID(authUser.UserID)
 	nickname := resolveAuthNickname(req.Nickname, authUser)
@@ -320,6 +374,9 @@ func (a *App) handleAuthExchange(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to create session", http.StatusInternalServerError)
 		return
 	}
+	created.UserType = "auth"
+	created.Email = strings.TrimSpace(authUser.Email)
+	created.EmailVerified = authUser.EmailVerified
 
 	if err := a.persistSession(created); err != nil {
 		a.sessions.Delete(created.SessionID)
@@ -333,6 +390,7 @@ func (a *App) handleAuthExchange(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, authExchangeResponse{
 		PlayerID:      created.PlayerID,
 		Nickname:      created.Nickname,
+		UserType:      created.UserType,
 		Email:         authUser.Email,
 		EmailVerified: authUser.EmailVerified,
 		ExpiresAt:     created.ExpiresAt.UTC().Format(time.RFC3339),
@@ -790,6 +848,30 @@ func (a *App) authFromCookie(r *http.Request) (session.PlayerSession, bool) {
 	}
 
 	return a.sessions.FindValid(cookie.Value)
+}
+
+// revokeSessionFromCookie는 같은 브라우저에서 새 세션 발급 전에 기존 세션/WS를 정리한다.
+func (a *App) revokeSessionFromCookie(r *http.Request) {
+	cookie, err := r.Cookie(a.cfg.SessionCookieName)
+	if err != nil {
+		return
+	}
+
+	sessionID := strings.TrimSpace(cookie.Value)
+	if sessionID == "" {
+		return
+	}
+
+	playerSession, exists := a.sessions.FindValid(sessionID)
+	a.sessions.Delete(sessionID)
+	if !exists {
+		return
+	}
+
+	// 동일 플레이어의 기존 WS 연결은 새 세션 발급 시 즉시 종료한다.
+	for _, client := range a.hub.clientsForPlayer(playerSession.PlayerID) {
+		a.closeClient(client)
+	}
 }
 
 func (a *App) setSessionCookie(w http.ResponseWriter, playerSession session.PlayerSession) {

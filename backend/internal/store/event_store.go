@@ -52,6 +52,7 @@ type EventStore interface {
 	EnsureWallet(ctx context.Context, playerID string, initialBalance int64) error
 	CreateBuyIn(ctx context.Context, playerID, tableID string, amount int64) (BuyInReceipt, error)
 	ConsumePendingBuyIn(ctx context.Context, playerID, tableID string) (BuyInReceipt, error)
+	IsNicknameTaken(ctx context.Context, nickname string) (bool, error)
 	SaveSession(ctx context.Context, playerSession session.PlayerSession) error
 	SaveTableEvent(ctx context.Context, event TableEvent) error
 }
@@ -153,6 +154,10 @@ func (n *noopEventStore) ConsumePendingBuyIn(_ context.Context, playerID, tableI
 
 func (*noopEventStore) SaveSession(context.Context, session.PlayerSession) error {
 	return nil
+}
+
+func (*noopEventStore) IsNicknameTaken(context.Context, string) (bool, error) {
+	return false, nil
 }
 
 func (*noopEventStore) SaveTableEvent(context.Context, TableEvent) error {
