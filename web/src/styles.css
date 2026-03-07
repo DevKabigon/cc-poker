@@ -200,6 +200,127 @@ a:not([data-slot="button"]):hover {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.poker-table-shell {
+  border-radius: 18px;
+  border: 1px solid color-mix(in oklch, var(--border) 68%, var(--primary) 32%);
+  background:
+    radial-gradient(
+      88% 120% at 50% 50%,
+      color-mix(in oklch, var(--primary) 26%, transparent),
+      transparent 70%
+    ),
+    color-mix(in oklch, var(--card) 90%, var(--secondary) 10%);
+  padding: 18px;
+}
+
+.poker-felt {
+  position: relative;
+  min-height: 520px;
+  border-radius: 220px;
+  border: 12px solid color-mix(in oklch, var(--secondary) 68%, var(--border) 32%);
+  background:
+    radial-gradient(
+      110% 110% at 50% 10%,
+      color-mix(in oklch, var(--primary) 24%, var(--card) 76%),
+      color-mix(in oklch, var(--secondary) 24%, var(--card) 76%)
+    );
+  box-shadow:
+    inset 0 0 0 3px color-mix(in oklch, var(--border) 64%, var(--primary) 36%),
+    inset 0 -34px 48px color-mix(in oklch, var(--primary) 10%, transparent),
+    0 16px 28px color-mix(in oklch, var(--primary) 12%, transparent);
+}
+
+.poker-center {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+.poker-label {
+  margin: 0;
+  font-size: 0.75rem;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: color-mix(in oklch, var(--muted-foreground) 72%, var(--foreground) 28%);
+  font-weight: 700;
+}
+
+.community-cards {
+  display: inline-flex;
+  gap: 8px;
+}
+
+.seat-node {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  width: 132px;
+  border: 1px solid color-mix(in oklch, var(--border) 70%, var(--primary) 30%);
+  border-radius: 12px;
+  padding: 8px;
+  background: color-mix(in oklch, var(--card) 90%, var(--secondary) 10%);
+  box-shadow: 0 8px 16px color-mix(in oklch, var(--primary) 10%, transparent);
+}
+
+.seat-node.occupied {
+  border-color: color-mix(in oklch, var(--primary) 54%, var(--border) 46%);
+  background:
+    linear-gradient(
+      160deg,
+      color-mix(in oklch, var(--primary) 15%, var(--card) 85%),
+      color-mix(in oklch, var(--secondary) 26%, var(--card) 74%)
+    );
+}
+
+.seat-node__meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.seat-node__meta span {
+  font-size: 0.72rem;
+  color: var(--muted-foreground);
+  font-weight: 700;
+}
+
+.seat-node strong {
+  display: block;
+  font-size: 0.88rem;
+  margin-bottom: 8px;
+  text-align: center;
+}
+
+.hole-cards {
+  display: flex;
+  justify-content: center;
+  gap: 6px;
+}
+
+.playing-card {
+  width: 32px;
+  height: 46px;
+  border-radius: 6px;
+  border: 1px solid color-mix(in oklch, var(--border) 74%, var(--primary) 26%);
+  background: color-mix(in oklch, var(--background) 90%, var(--card) 10%);
+  color: color-mix(in oklch, var(--foreground) 86%, var(--primary) 14%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  box-shadow: 0 4px 8px color-mix(in oklch, var(--primary) 9%, transparent);
+}
+
+.ghost-card {
+  color: color-mix(in oklch, var(--muted-foreground) 66%, var(--foreground) 34%);
+  background: color-mix(in oklch, var(--card) 82%, var(--secondary) 18%);
+}
+
 .seat {
   border: 1px dashed color-mix(in oklch, var(--border) 66%, var(--primary) 34%);
   border-radius: 14px;
@@ -299,5 +420,18 @@ a:not([data-slot="button"]):hover {
 
   .top-nav__left {
     width: 100%;
+  }
+
+  .poker-table-shell {
+    padding: 10px;
+  }
+
+  .poker-felt {
+    min-height: 640px;
+    border-radius: 26px;
+  }
+
+  .seat-node {
+    width: 116px;
   }
 }

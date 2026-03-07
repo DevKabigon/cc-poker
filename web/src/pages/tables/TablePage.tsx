@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { Link, Navigate, useParams } from "react-router-dom";
 import { TopNav } from "../../features/navigation/ui/TopNav";
 import { StatusBadge } from "../../features/play/ui/StatusBadge";
+import { PokerTableView } from "../../features/play/ui/PokerTableView";
 import { usePlayConsole } from "../../features/play/model/usePlayConsole";
 import { findRoomById, parseRoomIDFromTableID } from "../../features/rooms/model/roomCatalog";
 import { Badge } from "@/components/ui/badge";
@@ -157,26 +158,11 @@ export function TablePage() {
       <section className="layout">
         <Card className="panel table-panel reveal reveal-4">
           <CardHeader>
-            <CardTitle>Table Seat Map</CardTitle>
-            <CardDescription>현재 테이블 스냅샷 좌석 정보</CardDescription>
+            <CardTitle>Poker Table</CardTitle>
+            <CardDescription>실시간 좌석 상태와 기본 카드 보드</CardDescription>
           </CardHeader>
           <CardContent>
-            <div className="seat-map">
-              {seatGrid.map((slot) => (
-                <div key={slot.seat} className={`seat ${slot.player ? "occupied" : ""}`}>
-                  <span className="seat-num">Seat {slot.seat}</span>
-                  <strong>
-                    {slot.player ? (
-                      <>
-                        {slot.player.nickname} <Badge variant="secondary">{slot.player.stack}</Badge>
-                      </>
-                    ) : (
-                      "Empty"
-                    )}
-                  </strong>
-                </div>
-              ))}
-            </div>
+            <PokerTableView seats={seatGrid} />
           </CardContent>
         </Card>
 
